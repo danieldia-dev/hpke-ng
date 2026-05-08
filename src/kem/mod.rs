@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use rand_core::{CryptoRng, RngCore};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::HpkeError;
 use crate::sealed::Sealed;
@@ -63,6 +63,13 @@ pub trait Kem: Sealed {
 
 	/// Encode a public key to its wire bytes.
 	fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8>;
+
+	/// Encode a private key to its wire bytes.
+	///
+	/// Output is wrapped in [`Zeroizing`] so the heap copy is zeroed when
+	/// dropped. Callers persisting key material must place it in zeroizing
+	/// storage as well; otherwise scrubbing happens only at the boundary.
+	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>>;
 }
 
 /// KEMs that additionally support the authenticated mode (`Auth`/`AuthPsk`).

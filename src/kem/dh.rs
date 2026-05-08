@@ -66,6 +66,8 @@ pub trait DiffieHellman: Sealed + 'static {
 	fn sk_from_bytes(b: &[u8]) -> Result<Self::PrivateKey, HpkeError>;
 	/// Serialize a public key to bytes.
 	fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8>;
+	/// Serialize a private key to bytes (zeroized on drop).
+	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>>;
 	/// Derive the public key from a private key.
 	fn sk_to_pk(sk: &Self::PrivateKey) -> Self::PublicKey;
 }
@@ -283,6 +285,14 @@ macro_rules! nist_curve {
 				pk.encoded.clone()
 			}
 
+			fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
+				// `SecretKey::to_bytes` returns a `GenericArray` whose `Drop` does
+				// not zeroize. Wrap the temporary in `Zeroizing` so the only
+				// surviving copy is the returned `Zeroizing<Vec<u8>>`.
+				let bytes = Zeroizing::new(sk.0.to_bytes());
+				Zeroizing::new(bytes.as_slice().to_vec())
+			}
+
 			fn sk_to_pk(sk: &Self::PrivateKey) -> Self::PublicKey {
 				$make_pk(sk.0.public_key())
 			}
@@ -386,6 +396,9 @@ impl<D: DiffieHellman, H: Kdf> Kem for DhKem<D, H> {
 	}
 	fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8> {
 		D::pk_to_bytes(&pk.0)
+	}
+	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
+		D::sk_to_bytes(&sk.0)
 	}
 }
 
@@ -617,6 +630,13 @@ impl DiffieHellman for X25519 {
 		pk.0.to_vec()
 	}
 
+	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
+		// `StaticSecret::to_bytes` returns a `[u8; 32]` whose `Drop` does not
+		// zeroize. Wrap the temporary so it's scrubbed once the `Vec` is copied.
+		let bytes = Zeroizing::new(sk.0.to_bytes());
+		Zeroizing::new(bytes.to_vec())
+	}
+
 	fn sk_to_pk(sk: &Self::PrivateKey) -> Self::PublicKey {
 		let pk = x25519_dalek::PublicKey::from(&sk.0);
 		X25519PublicKeyWrap(pk.to_bytes())
@@ -824,6 +844,10 @@ impl DiffieHellman for X448 {
 
 	fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8> {
 		pk.0.to_vec()
+	}
+
+	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
+		Zeroizing::new(sk.0.to_vec())
 	}
 
 	fn sk_to_pk(sk: &Self::PrivateKey) -> Self::PublicKey {
@@ -1154,5 +1178,92 @@ mod tests {
 			P256::pk_from_bytes(&tampered),
 			Err(HpkeError::InvalidPublicKey)
 		));
+	}
+
+	/// `sk_to_bytes` ∘ `sk_from_bytes` must roundtrip: a derived sk re-loaded from
+	/// its serialized bytes must produce the same shared secret on encap/decap.
+	/// The byte length must equal `PRIVATE_KEY_LEN`.
+	#[test]
+	fn x25519_sk_to_bytes_roundtrip() {
+		type Suite = DhKem<X25519, crate::HkdfSha256>;
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
+		let sk_bytes = Suite::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
+		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+	}
+
+	#[test]
+	fn p256_sk_to_bytes_roundtrip() {
+		type Suite = DhKem<P256, crate::HkdfSha256>;
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
+		let sk_bytes = Suite::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
+		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+	}
+
+	#[test]
+	fn p384_sk_to_bytes_roundtrip() {
+		type Suite = DhKem<P384, crate::HkdfSha384>;
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
+		let sk_bytes = Suite::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
+		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+	}
+
+	#[test]
+	fn p521_sk_to_bytes_roundtrip() {
+		type Suite = DhKem<P521, crate::HkdfSha512>;
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
+		let sk_bytes = Suite::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
+		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+	}
+
+	#[test]
+	fn k256_sk_to_bytes_roundtrip() {
+		type Suite = DhKem<K256, crate::HkdfSha256>;
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
+		let sk_bytes = Suite::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
+		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+	}
+
+	#[test]
+	fn x448_sk_to_bytes_roundtrip() {
+		type Suite = DhKem<X448, crate::HkdfSha512>;
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
+		let sk_bytes = Suite::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
+		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
 	}
 }

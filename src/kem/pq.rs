@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 
 use rand_core::{CryptoRng, RngCore};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::HpkeError;
 use crate::kem::Kem;
@@ -210,6 +210,10 @@ impl Kem for XWingDraft06 {
 	fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8> {
 		pk.0.clone()
 	}
+
+	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
+		Zeroizing::new(sk.seed.to_vec())
+	}
 }
 
 /// Derive an X-Wing keypair from a 32-byte seed.
@@ -406,6 +410,10 @@ macro_rules! ml_kem_variant {
 			fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8> {
 				pk.0.clone()
 			}
+
+			fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
+				Zeroizing::new(sk.seed.to_vec())
+			}
 		}
 
 		fn $from_seed(seed: [u8; 64]) -> ($sk_wrap, $pk_wrap) {
@@ -594,5 +602,48 @@ mod tests {
 		let ikm: [u8; 64] = core::array::from_fn(|i| u8::try_from(i).unwrap().wrapping_add(1));
 		let (sk, _) = MlKem1024::derive_key_pair(&ikm).unwrap();
 		assert_eq!(sk.seed, ikm);
+	}
+
+	/// `sk_to_bytes` returns the 32-byte X-Wing seed and roundtrips through
+	/// `sk_from_bytes` such that decap with the loaded key matches encap.
+	#[test]
+	fn xwing_sk_to_bytes_roundtrip() {
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = XWingDraft06::generate(&mut rng).unwrap();
+		let sk_bytes = XWingDraft06::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), 32);
+		let sk_loaded = XWingDraft06::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = XWingDraft06::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = XWingDraft06::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+	}
+
+	/// `sk_to_bytes` returns the 64-byte (d, z) seed for ML-KEM-768; loading the
+	/// bytes back must rebuild the same expanded `dk`.
+	#[test]
+	fn ml_kem_768_sk_to_bytes_roundtrip() {
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = MlKem768::generate(&mut rng).unwrap();
+		let sk_bytes = MlKem768::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), 64);
+		let sk_loaded = MlKem768::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = MlKem768::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = MlKem768::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+	}
+
+	#[test]
+	fn ml_kem_1024_sk_to_bytes_roundtrip() {
+		let mut os_rng = OsRng;
+		let mut rng = os_rng.unwrap_mut();
+		let (sk_r, pk_r) = MlKem1024::generate(&mut rng).unwrap();
+		let sk_bytes = MlKem1024::sk_to_bytes(&sk_r);
+		assert_eq!(sk_bytes.len(), 64);
+		let sk_loaded = MlKem1024::sk_from_bytes(&sk_bytes).unwrap();
+		let (ss_e, enc) = MlKem1024::encap(&mut rng, &pk_r).unwrap();
+		let ss_d = MlKem1024::decap(&enc, &sk_loaded).unwrap();
+		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
 	}
 }
