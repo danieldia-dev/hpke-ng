@@ -5,6 +5,8 @@
 
 A clean-slate Rust implementation of [HPKE (RFC 9180)](https://www.rfc-editor.org/rfc/rfc9180.html) with type-driven ciphersuite selection.
 
+> Read the announcement: **[hpke-ng: A Clean-Slate HPKE Implementation for Rust](https://symbolic.software/blog/2026-05-08-hpke-ng/)** — for the full design rationale, benchmarks, and migration notes.
+
 ```rust
 use hpke_ng::*;
 use rand_core::OsRng;
@@ -20,15 +22,36 @@ assert_eq!(pt, b"hello");
 # Ok::<_, hpke_ng::HpkeError>(())
 ```
 
+## Why a new HPKE crate?
+
+`hpke-ng` exists because three friction points in the existing Rust HPKE story kept producing real bugs and real overhead:
+
+1. **Provider abstraction overhead.** A trait-based pluggable backend pushes dispatch costs into hot paths and inflates the `Hpke` struct to hundreds of bytes — for a value the type system already knows.
+2. **Struct-owned PRNG hazard.** When the `Hpke` instance owns its RNG, cloning silently aliases randomness state. The fix is structural: don't own it.
+3. **Type-system gaps.** `Option<&[u8]>` for mode-specific parameters turns missing-PSK and wrong-mode into runtime errors that should be compile errors.
+
+The design takes one position on each: **no provider abstraction, no owned RNG, type parameters instead of mode enums.** The math is a solved problem; the surrounding library is where the engineering still has slack.
+
 ## Design highlights
 
 - **Type-parameterized API.** `Hpke<K, F, A>` is zero-sized; the ciphersuite lives in the type system. Mismatched primitives are compile errors.
 - **Four explicit methods per mode.** `seal_base`, `seal_psk`, `seal_auth`, `seal_auth_psk` — no `Option<&[u8]>` parameters for required-by-mode arguments.
 - **Auth restricted to DHKEMs at the type level.** `Hpke::<XWingDraft06, ...>::seal_auth(...)` does not compile.
 - **Export-only restricted at the type level.** `Hpke::<_, _, ExportOnly>::seal_base(...)` does not compile; only `*_export*` methods are available.
-- **Caller-provided RNG.** No PRNG owned by the configuration.
+- **Type-tagged keys.** Private keys carry their KEM in their type, so passing a `DhKemP256` key into an X25519 suite is rejected by the compiler, not at runtime.
+- **Caller-provided RNG.** No PRNG owned by the configuration; cloning cannot alias randomness.
+- **Structural nonce-reuse prevention.** `Context` is non-cloneable and refuses to encrypt at `seq == u64::MAX`.
 - **`no_std` + `alloc`** by default. `std` feature for `std::error::Error` impl on `HpkeError`.
 - **One provider stack.** All primitives from RustCrypto-org crates.
+
+## Compile-time guarantees
+
+| Operation                                | Elsewhere       | hpke-ng                        |
+|------------------------------------------|-----------------|--------------------------------|
+| Calling `seal_auth` on a non-DH KEM      | Runtime error   | Compile error                  |
+| Using a wrong-KEM private key            | Runtime mismatch| Compile error (type-tagged)    |
+| Base-mode call with a PSK supplied       | Runtime error   | Compile error (no PSK param)   |
+| Encrypt with an `ExportOnly` AEAD        | Runtime error   | Compile error                  |
 
 ## Supported ciphersuites
 
@@ -39,6 +62,29 @@ assert_eq!(pt, b"hello");
 | KDFs | `HkdfSha256`, `HkdfSha384`, `HkdfSha512` |
 | AEADs | `Aes128Gcm`, `Aes256Gcm`, `ChaCha20Poly1305`, `ExportOnly` |
 | Modes | Base, Psk, Auth, AuthPsk |
+
+## Performance
+
+Across 44 head-to-head benchmarks vs. `hpke-rs`: **16 wins** for `hpke-ng` (notably encap/decap, 21–22% faster), **25 ties** where the underlying primitive dominates, **3 losses** on isolated key-generation paths.
+
+Memory and binary footprint:
+
+| Quantity                | hpke-rs   | hpke-ng   |
+|-------------------------|-----------|-----------|
+| `Hpke<...>` struct      | 320 bytes | **0 bytes** (`PhantomData`) |
+| `Context<...>` struct   | 400 bytes | **80 bytes** |
+| Minimal release binary  | 561 KB    | **392 KB** (~30% smaller) |
+
+Build with `RUSTFLAGS="-C target-cpu=native"` for AES-NI / SHA-NI where available. The `[profile.bench]` in `Cargo.toml` enables `lto = "thin"` and `codegen-units = 1`. For head-to-head numbers, run `cargo bench --features comparative --bench comparative` locally.
+
+## Security posture
+
+The library responds to two classes of issue observed in prior implementations:
+
+- **Zero shared-secret check (RFC 9180 §7.1.4).** Enforced for X25519 and X448 using `subtle::ConstantTimeEq`.
+- **Nonce counter wraparound.** Prevented structurally: `Context` uses a `u64` sequence number, refuses to encrypt at `u64::MAX`, and is non-cloneable so a counter cannot fork.
+
+The post-DH all-zeros check is constant-time. `Context` cannot be `Clone`d, so two ciphertexts cannot be produced under the same `(key, nonce)` from two copies of the same context.
 
 ## Constant-time considerations
 
@@ -53,14 +99,6 @@ This crate composes RustCrypto primitives. Constant-time properties are inherite
 | AES-128-GCM, AES-256-GCM | **CT only with hardware AES-NI/PCLMULQDQ.** Prefer `ChaCha20Poly1305` on platforms without these instructions. |
 | ML-KEM, X-Wing | CT per upstream documentation; both crates are pre-1.0. |
 
-The post-DH all-zeros check (RFC 9180 §7.1.4) uses `subtle::ConstantTimeEq` for X25519 and X448.
-
-## Performance
-
-Build with `RUSTFLAGS="-C target-cpu=native"` for AES-NI / SHA-NI instructions where available. The `[profile.bench]` in `Cargo.toml` enables `lto = "thin"` and `codegen-units = 1`.
-
-For head-to-head numbers vs `hpke-rs`, run `cargo bench --features comparative --bench comparative` locally.
-
 ## Testing
 
 ```bash
@@ -69,6 +107,18 @@ cargo test --features pq                                # + post-quantum tests
 cargo test --features pq,kat-internals                  # + RFC 9180 KAT
 cargo test --features pq,differential,kat-internals     # + cross-impl differential vs hpke-rs
 ```
+
+Coverage includes 59 macro-generated roundtrip tests across every ciphersuite × mode combination, four `cargo-fuzz` targets (panics treated as bugs), and differential testing against `hpke-rs` for wire-format interop. The full suite (without differential) runs in under two seconds.
+
+## Migration from `hpke-rs`
+
+Three mechanical steps, typically under an hour for a real codebase:
+
+1. Define a `type Suite = Hpke<K, F, A>;` alias for the ciphersuite you use.
+2. Replace `hpke.seal(...)` calls with the explicit mode method: `Suite::seal_base`, `seal_psk`, `seal_auth`, or `seal_auth_psk`.
+3. Thread `&mut rng` through call sites — the configuration no longer owns one.
+
+See the [announcement post](https://symbolic.software/blog/2026-05-08-hpke-ng/) for a worked example.
 
 ## License
 
