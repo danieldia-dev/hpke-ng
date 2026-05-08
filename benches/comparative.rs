@@ -8,7 +8,7 @@
 //!
 //! Coverage:
 //! - **KEM ops**: generate / derive_key_pair / encap / decap, across X25519,
-//!   P-256, K256 (the three KEMs hpke-rs's RustCrypto provider supports).
+//!   P-256, K256, X-Wing (draft-06), ML-KEM-768, and ML-KEM-1024.
 //! - **Setup paths**: setup_sender_* / setup_receiver_* across multiple
 //!   ciphersuites and modes (Base + Psk).
 //! - **Single-shot seal/open**: 8 payload sizes (16 B → 256 KiB), multiple
@@ -282,6 +282,297 @@ fn bench_kem_k256(c: &mut Criterion) {
 	g.finish();
 }
 
+fn bench_kem_xwing(c: &mut Criterion) {
+	let mut g = c.benchmark_group("kem/xwing");
+
+	g.bench_function("hpke_ng/generate", |b| {
+		b.iter(|| {
+			let mut os = OsRng;
+			ng::XWingDraft06::generate(&mut os.unwrap_mut()).unwrap()
+		})
+	});
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::XWingDraft06,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		g.bench_function("hpke_rs/generate", |b| {
+			b.iter(|| {
+				rs.seed(SEED).unwrap();
+				rs.generate_key_pair().unwrap()
+			})
+		});
+	}
+
+	let ikm = [0x99u8; 32];
+	g.bench_function("hpke_ng/derive_key_pair", |b| {
+		b.iter(|| ng::XWingDraft06::derive_key_pair(black_box(&ikm)).unwrap())
+	});
+	{
+		let rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::XWingDraft06,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		g.bench_function("hpke_rs/derive_key_pair", |b| {
+			b.iter(|| rs.derive_key_pair(black_box(&ikm)).unwrap())
+		});
+	}
+
+	{
+		let mut os = OsRng;
+		let (_, pk_ng) = ng::XWingDraft06::generate(&mut os.unwrap_mut()).unwrap();
+		g.bench_function("hpke_ng/encap", |b| {
+			b.iter(|| {
+				let mut os = OsRng;
+				ng::XWingDraft06::encap(&mut os.unwrap_mut(), black_box(&pk_ng)).unwrap()
+			})
+		});
+	}
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::XWingDraft06,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
+			b.iter(|| {
+				rs.seed(SEED).unwrap();
+				rs.setup_sender(black_box(&pk), b"", None, None, None)
+					.unwrap()
+			})
+		});
+	}
+
+	{
+		let mut os = OsRng;
+		let (sk_ng, pk_ng) = ng::XWingDraft06::generate(&mut os.unwrap_mut()).unwrap();
+		let (_, enc_ng) = ng::XWingDraft06::encap(&mut os.unwrap_mut(), &pk_ng).unwrap();
+		g.bench_function("hpke_ng/decap", |b| {
+			b.iter(|| ng::XWingDraft06::decap(black_box(&enc_ng), &sk_ng).unwrap())
+		});
+	}
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::XWingDraft06,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
+		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
+		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
+			b.iter(|| {
+				rs.setup_receiver(black_box(&enc), &sk, b"", None, None, None)
+					.unwrap()
+			})
+		});
+	}
+
+	g.finish();
+}
+
+fn bench_kem_mlkem768(c: &mut Criterion) {
+	let mut g = c.benchmark_group("kem/mlkem768");
+
+	g.bench_function("hpke_ng/generate", |b| {
+		b.iter(|| {
+			let mut os = OsRng;
+			ng::MlKem768::generate(&mut os.unwrap_mut()).unwrap()
+		})
+	});
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem768,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		g.bench_function("hpke_rs/generate", |b| {
+			b.iter(|| {
+				rs.seed(SEED).unwrap();
+				rs.generate_key_pair().unwrap()
+			})
+		});
+	}
+
+	// hpke-ng ML-KEM derive_key_pair requires a 64-byte (d || z) seed
+	// per draft-connolly-cfrg-hpke-mlkem-04 §3.2. hpke-rs SHAKE-256s the
+	// IKM down to 64, so a 64-byte IKM works for both.
+	let ikm = [0x99u8; 64];
+	g.bench_function("hpke_ng/derive_key_pair", |b| {
+		b.iter(|| ng::MlKem768::derive_key_pair(black_box(&ikm)).unwrap())
+	});
+	{
+		let rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem768,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		g.bench_function("hpke_rs/derive_key_pair", |b| {
+			b.iter(|| rs.derive_key_pair(black_box(&ikm)).unwrap())
+		});
+	}
+
+	{
+		let mut os = OsRng;
+		let (_, pk_ng) = ng::MlKem768::generate(&mut os.unwrap_mut()).unwrap();
+		g.bench_function("hpke_ng/encap", |b| {
+			b.iter(|| {
+				let mut os = OsRng;
+				ng::MlKem768::encap(&mut os.unwrap_mut(), black_box(&pk_ng)).unwrap()
+			})
+		});
+	}
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem768,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
+			b.iter(|| {
+				rs.seed(SEED).unwrap();
+				rs.setup_sender(black_box(&pk), b"", None, None, None)
+					.unwrap()
+			})
+		});
+	}
+
+	{
+		let mut os = OsRng;
+		let (sk_ng, pk_ng) = ng::MlKem768::generate(&mut os.unwrap_mut()).unwrap();
+		let (_, enc_ng) = ng::MlKem768::encap(&mut os.unwrap_mut(), &pk_ng).unwrap();
+		g.bench_function("hpke_ng/decap", |b| {
+			b.iter(|| ng::MlKem768::decap(black_box(&enc_ng), &sk_ng).unwrap())
+		});
+	}
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem768,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
+		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
+		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
+			b.iter(|| {
+				rs.setup_receiver(black_box(&enc), &sk, b"", None, None, None)
+					.unwrap()
+			})
+		});
+	}
+
+	g.finish();
+}
+
+fn bench_kem_mlkem1024(c: &mut Criterion) {
+	let mut g = c.benchmark_group("kem/mlkem1024");
+
+	g.bench_function("hpke_ng/generate", |b| {
+		b.iter(|| {
+			let mut os = OsRng;
+			ng::MlKem1024::generate(&mut os.unwrap_mut()).unwrap()
+		})
+	});
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem1024,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		g.bench_function("hpke_rs/generate", |b| {
+			b.iter(|| {
+				rs.seed(SEED).unwrap();
+				rs.generate_key_pair().unwrap()
+			})
+		});
+	}
+
+	let ikm = [0x99u8; 64];
+	g.bench_function("hpke_ng/derive_key_pair", |b| {
+		b.iter(|| ng::MlKem1024::derive_key_pair(black_box(&ikm)).unwrap())
+	});
+	{
+		let rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem1024,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		g.bench_function("hpke_rs/derive_key_pair", |b| {
+			b.iter(|| rs.derive_key_pair(black_box(&ikm)).unwrap())
+		});
+	}
+
+	{
+		let mut os = OsRng;
+		let (_, pk_ng) = ng::MlKem1024::generate(&mut os.unwrap_mut()).unwrap();
+		g.bench_function("hpke_ng/encap", |b| {
+			b.iter(|| {
+				let mut os = OsRng;
+				ng::MlKem1024::encap(&mut os.unwrap_mut(), black_box(&pk_ng)).unwrap()
+			})
+		});
+	}
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem1024,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
+			b.iter(|| {
+				rs.seed(SEED).unwrap();
+				rs.setup_sender(black_box(&pk), b"", None, None, None)
+					.unwrap()
+			})
+		});
+	}
+
+	{
+		let mut os = OsRng;
+		let (sk_ng, pk_ng) = ng::MlKem1024::generate(&mut os.unwrap_mut()).unwrap();
+		let (_, enc_ng) = ng::MlKem1024::encap(&mut os.unwrap_mut(), &pk_ng).unwrap();
+		g.bench_function("hpke_ng/decap", |b| {
+			b.iter(|| ng::MlKem1024::decap(black_box(&enc_ng), &sk_ng).unwrap())
+		});
+	}
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::MlKem1024,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::ChaCha20Poly1305,
+		);
+		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
+		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
+		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
+			b.iter(|| {
+				rs.setup_receiver(black_box(&enc), &sk, b"", None, None, None)
+					.unwrap()
+			})
+		});
+	}
+
+	g.finish();
+}
+
 // =============================================================================
 //  Setup paths: setup_sender / setup_receiver across ciphersuites
 // =============================================================================
@@ -456,6 +747,144 @@ fn bench_setup_k256_chacha(c: &mut Criterion) {
 		b.iter(|| {
 			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
+				.unwrap()
+		})
+	});
+	g.finish();
+}
+
+fn bench_setup_xwing_chacha(c: &mut Criterion) {
+	type Suite = ng::Hpke<ng::XWingDraft06, ng::HkdfSha256, ng::ChaCha20Poly1305>;
+	let mut os = OsRng;
+	let (sk_ng, pk_ng) = ng::XWingDraft06::generate(&mut os.unwrap_mut()).unwrap();
+	let (enc_ng, _ctx_ng) =
+		Suite::setup_sender_base(&mut os.unwrap_mut(), &pk_ng, b"info").unwrap();
+
+	let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+		Mode::Base,
+		rs_types::KemAlgorithm::XWingDraft06,
+		rs_types::KdfAlgorithm::HkdfSha256,
+		rs_types::AeadAlgorithm::ChaCha20Poly1305,
+	);
+	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+	rs.seed(SEED).unwrap();
+	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
+
+	let mut g = c.benchmark_group("xwing_chacha20/setup_sender_base");
+	g.bench_function("hpke_ng", |b| {
+		b.iter(|| {
+			let mut os = OsRng;
+			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
+		})
+	});
+	g.bench_function("hpke_rs", |b| {
+		b.iter(|| {
+			rs.seed(SEED).unwrap();
+			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
+				.unwrap()
+		})
+	});
+	g.finish();
+
+	let mut g = c.benchmark_group("xwing_chacha20/setup_receiver_base");
+	g.bench_function("hpke_ng", |b| {
+		b.iter(|| Suite::setup_receiver_base(black_box(&enc_ng), &sk_ng, b"info").unwrap())
+	});
+	g.bench_function("hpke_rs", |b| {
+		b.iter(|| {
+			rs.setup_receiver(black_box(&enc_rs), &sk_rs, b"info", None, None, None)
+				.unwrap()
+		})
+	});
+	g.finish();
+}
+
+fn bench_setup_mlkem768_chacha(c: &mut Criterion) {
+	type Suite = ng::Hpke<ng::MlKem768, ng::HkdfSha256, ng::ChaCha20Poly1305>;
+	let mut os = OsRng;
+	let (sk_ng, pk_ng) = ng::MlKem768::generate(&mut os.unwrap_mut()).unwrap();
+	let (enc_ng, _ctx_ng) =
+		Suite::setup_sender_base(&mut os.unwrap_mut(), &pk_ng, b"info").unwrap();
+
+	let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+		Mode::Base,
+		rs_types::KemAlgorithm::MlKem768,
+		rs_types::KdfAlgorithm::HkdfSha256,
+		rs_types::AeadAlgorithm::ChaCha20Poly1305,
+	);
+	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+	rs.seed(SEED).unwrap();
+	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
+
+	let mut g = c.benchmark_group("mlkem768_chacha20/setup_sender_base");
+	g.bench_function("hpke_ng", |b| {
+		b.iter(|| {
+			let mut os = OsRng;
+			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
+		})
+	});
+	g.bench_function("hpke_rs", |b| {
+		b.iter(|| {
+			rs.seed(SEED).unwrap();
+			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
+				.unwrap()
+		})
+	});
+	g.finish();
+
+	let mut g = c.benchmark_group("mlkem768_chacha20/setup_receiver_base");
+	g.bench_function("hpke_ng", |b| {
+		b.iter(|| Suite::setup_receiver_base(black_box(&enc_ng), &sk_ng, b"info").unwrap())
+	});
+	g.bench_function("hpke_rs", |b| {
+		b.iter(|| {
+			rs.setup_receiver(black_box(&enc_rs), &sk_rs, b"info", None, None, None)
+				.unwrap()
+		})
+	});
+	g.finish();
+}
+
+fn bench_setup_mlkem1024_chacha(c: &mut Criterion) {
+	type Suite = ng::Hpke<ng::MlKem1024, ng::HkdfSha256, ng::ChaCha20Poly1305>;
+	let mut os = OsRng;
+	let (sk_ng, pk_ng) = ng::MlKem1024::generate(&mut os.unwrap_mut()).unwrap();
+	let (enc_ng, _ctx_ng) =
+		Suite::setup_sender_base(&mut os.unwrap_mut(), &pk_ng, b"info").unwrap();
+
+	let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+		Mode::Base,
+		rs_types::KemAlgorithm::MlKem1024,
+		rs_types::KdfAlgorithm::HkdfSha256,
+		rs_types::AeadAlgorithm::ChaCha20Poly1305,
+	);
+	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+	rs.seed(SEED).unwrap();
+	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
+
+	let mut g = c.benchmark_group("mlkem1024_chacha20/setup_sender_base");
+	g.bench_function("hpke_ng", |b| {
+		b.iter(|| {
+			let mut os = OsRng;
+			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
+		})
+	});
+	g.bench_function("hpke_rs", |b| {
+		b.iter(|| {
+			rs.seed(SEED).unwrap();
+			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
+				.unwrap()
+		})
+	});
+	g.finish();
+
+	let mut g = c.benchmark_group("mlkem1024_chacha20/setup_receiver_base");
+	g.bench_function("hpke_ng", |b| {
+		b.iter(|| Suite::setup_receiver_base(black_box(&enc_ng), &sk_ng, b"info").unwrap())
+	});
+	g.bench_function("hpke_rs", |b| {
+		b.iter(|| {
+			rs.setup_receiver(black_box(&enc_rs), &sk_rs, b"info", None, None, None)
 				.unwrap()
 		})
 	});
@@ -737,10 +1166,16 @@ criterion_group! {
 		bench_kem_x25519,
 		bench_kem_p256,
 		bench_kem_k256,
+		bench_kem_xwing,
+		bench_kem_mlkem768,
+		bench_kem_mlkem1024,
 		bench_setup_x25519_chacha,
 		bench_setup_x25519_aes128,
 		bench_setup_p256_aes128,
 		bench_setup_k256_chacha,
+		bench_setup_xwing_chacha,
+		bench_setup_mlkem768_chacha,
+		bench_setup_mlkem1024_chacha,
 		bench_seal_x25519_chacha_payload_sweep,
 		bench_seal_x25519_aes128_payload_sweep,
 		bench_open_x25519_chacha_payload_sweep,

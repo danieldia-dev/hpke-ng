@@ -38,12 +38,12 @@ std           = ["rand_core/std", "subtle/std", "hkdf/std", "sha2/std", "sha3/st
 pq            = ["dep:ml-kem", "dep:x-wing", "dep:rand_core_10"]
 serde         = ["dep:serde"]
 differential  = []
-comparative   = []
+comparative   = ["pq"]
 kat-internals = []
 
 [dev-dependencies]
 hpke-rs             = { version = "0.6", features = ["std", "rustcrypto", "hpke-test", "hpke-test-prng", "hazmat"] }
-hpke-rs-rust-crypto = "0.6"
+hpke-rs-rust-crypto = { version = "0.6", features = ["experimental"] }
 hpke-rs-crypto      = "0.6"
 serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"

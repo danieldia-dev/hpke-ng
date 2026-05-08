@@ -65,7 +65,7 @@ The design takes one position on each: **no provider abstraction, no owned RNG, 
 
 ## Performance
 
-Across 44 head-to-head benchmarks vs. `hpke-rs`: **16 wins** for `hpke-ng` (notably encap/decap, 21–22% faster), **25 ties** where the underlying primitive dominates, **3 losses** on isolated key-generation paths.
+Across 62 head-to-head benchmarks vs. `hpke-rs`: **27 wins** for `hpke-ng`, **32 ties** where the underlying primitive dominates, **3 losses** on isolated key-generation paths. The largest deltas are on the post-quantum decap path — ML-KEM-768 and ML-KEM-1024 land 54–55% faster because `hpke-ng` materializes the FIPS 203 decapsulation key once at construction while `hpke-rs` reconstructs it from the 64-byte seed on every `setup_receiver`. ML-KEM encap follows at 25–29%, X-Wing encap/decap at 11–16%, and X25519 encap/decap at 21–22%.
 
 Memory and binary footprint:
 
@@ -75,7 +75,7 @@ Memory and binary footprint:
 | `Context<...>` struct   | 400 bytes | **80 bytes** |
 | Minimal release binary  | 561 KB    | **392 KB** (~30% smaller) |
 
-Build with `RUSTFLAGS="-C target-cpu=native"` for AES-NI / SHA-NI where available. The `[profile.bench]` in `Cargo.toml` enables `lto = "thin"` and `codegen-units = 1`. For head-to-head numbers, run `cargo bench --features comparative --bench comparative` locally.
+Build with `RUSTFLAGS="-C target-cpu=native"` for AES-NI / SHA-NI where available. The `[profile.bench]` in `Cargo.toml` enables `lto = "thin"` and `codegen-units = 1`. For head-to-head numbers, run `cargo bench --features comparative --bench comparative` locally; the comparative bench enables `hpke-rs-rust-crypto`'s `experimental` feature so the post-quantum KEM stubs are wired up on the `hpke-rs` side.
 
 ## Security posture
 
