@@ -5,7 +5,7 @@
 
 A clean-slate Rust implementation of [HPKE (RFC 9180)](https://www.rfc-editor.org/rfc/rfc9180.html) with type-driven ciphersuite selection.
 
-> Read the announcement: **[hpke-ng: A Clean-Slate HPKE Implementation for Rust](https://symbolic.software/blog/2026-05-08-hpke-ng/)** — for the full design rationale, benchmarks, and migration notes.
+> Read the announcement: **[hpke-ng: Faster, Smaller, Harder HPKE for Rust](https://symbolic.software/blog/2026-05-08-hpke-ng/)** — for the full design rationale, benchmarks, and migration notes.
 
 ```rust
 use hpke_ng::*;
