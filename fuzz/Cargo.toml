@@ -1,0 +1,54 @@
+[package]
+name         = "hpke-ng-fuzz"
+version      = "0.0.0"
+publish      = false
+edition      = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Break out of any parent workspace; this crate is only used via cargo-fuzz.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.hpke-ng]
+path     = ".."
+features = ["pq", "kat-internals"]
+
+# Keep optimisations on for libFuzzer; debug assertions remain enabled by
+# default (cargo-fuzz overrides `[profile.release].debug-assertions = true`).
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+
+[[bin]]
+name  = "pk_from_bytes"
+path  = "fuzz_targets/pk_from_bytes.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "enc_from_bytes"
+path  = "fuzz_targets/enc_from_bytes.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "open"
+path  = "fuzz_targets/open.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "key_schedule"
+path  = "fuzz_targets/key_schedule.rs"
+test  = false
+doc   = false
+bench = false

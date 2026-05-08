@@ -1,0 +1,69 @@
+[package]
+name         = "hpke-ng"
+version      = "0.1.0-rc.1"
+edition      = "2024"
+rust-version = "1.95"
+license      = "Apache-2.0 OR MIT"
+repository   = "https://github.com/symbolicsoft/hpke-ng"
+description  = "Clean, fast, RFC 9180 HPKE implementation."
+readme       = "README.md"
+keywords     = ["hpke", "crypto", "rfc9180", "encryption"]
+categories   = ["cryptography", "no-std"]
+
+[dependencies]
+zeroize          = { version = "1.8",  default-features = false, features = ["derive", "alloc"] }
+subtle           = { version = "2.6",  default-features = false }
+rand_core        = { version = "0.9",  default-features = false }
+rand_core_06     = { package = "rand_core", version = "0.6", default-features = false }
+rand_core_10     = { package = "rand_core", version = "0.10", default-features = false, optional = true }
+hkdf             = { version = "0.12", default-features = false }
+sha2             = { version = "0.10", default-features = false }
+sha3             = { version = "0.10", default-features = false }
+aead             = { version = "0.5",  default-features = false, features = ["alloc"] }
+aes-gcm          = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+x25519-dalek     = { version = "2",    default-features = false, features = ["zeroize", "static_secrets"] }
+ed448-goldilocks = { version = "0.14.0-pre.12", default-features = false }
+p256             = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
+p384             = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
+p521             = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
+k256             = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
+ml-kem           = { version = "0.3.0-rc.0", default-features = false, features = ["zeroize"], optional = true }
+x-wing           = { version = "0.1.0-rc.0", default-features = false, features = ["zeroize"], optional = true }
+serde            = { version = "1",    default-features = false, features = ["derive"], optional = true }
+
+[features]
+default       = ["std"]
+std           = ["rand_core/std", "subtle/std", "hkdf/std", "sha2/std", "sha3/std", "aes-gcm/std", "chacha20poly1305/std"]
+pq            = ["dep:ml-kem", "dep:x-wing", "dep:rand_core_10"]
+serde         = ["dep:serde"]
+differential  = []
+comparative   = []
+kat-internals = []
+
+[dev-dependencies]
+hpke-rs             = { version = "0.6", features = ["std", "rustcrypto", "hpke-test", "hpke-test-prng", "hazmat"] }
+hpke-rs-rust-crypto = "0.6"
+hpke-rs-crypto      = "0.6"
+serde               = { version = "1", features = ["derive"] }
+serde_json          = "1"
+rand                = "0.9"
+rand_chacha         = "0.9"
+criterion           = { version = "0.8", features = ["html_reports"] }
+hex                 = "0.4"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+[[test]]
+name = "kat"
+required-features = ["kat-internals"]
+
+[[bench]]
+name = "bench"
+harness = false
+[[bench]]
+name = "comparative"
+harness = false
+required-features = ["comparative"]

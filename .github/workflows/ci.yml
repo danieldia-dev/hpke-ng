@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - name: cargo fmt
+        if: runner.os != 'Windows'
+        run: cargo fmt --check
+      - name: cargo clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (pq + kat-internals)
+        run: cargo clippy --all-targets --features pq,kat-internals -- -D warnings
+      - name: cargo test
+        run: cargo test
+      - name: cargo test (pq + kat-internals)
+        run: cargo test --features pq,kat-internals
+      - name: cargo test (pq + differential + kat-internals)
+        run: cargo test --features pq,differential,kat-internals
+      - name: cargo build --release
+        run: cargo build --release
+
+  no-std:
+    name: no-std check (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: thumbv7em-none-eabihf
+      - run: cargo check --target thumbv7em-none-eabihf --no-default-features
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --features pq
