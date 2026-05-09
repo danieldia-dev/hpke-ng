@@ -7,9 +7,14 @@ use crate::sealed::Sealed;
 
 /// Sealed trait for HPKE-supported AEAD ciphersuite components.
 ///
-/// Implementors expose the IANA ID and length parameters. Sealing/opening live
-/// on the [`SealingAead`] subtrait so that export-only configurations cannot
-/// be passed to `seal_*`/`open_*` methods.
+/// Implementors expose the IANA ID, length parameters, and a cached
+/// `Cipher` state. The cipher is materialized once at key-schedule time
+/// (see [`Aead::init`]) and reused for every subsequent
+/// [`SealingAead::seal`] / [`SealingAead::open`] call — eliminating the
+/// AES key-schedule expansion + `GHash` precompute cost on each AEAD
+/// operation. Sealing/opening live on the [`SealingAead`] subtrait so
+/// export-only configurations cannot be passed to `seal_*`/`open_*`
+/// methods.
 pub trait Aead: Sealed {
 	/// IANA AEAD ID (RFC 9180 §7.3).
 	const ID: u16;
@@ -19,6 +24,17 @@ pub trait Aead: Sealed {
 	const NONCE_LEN: usize;
 	/// Authentication tag length in bytes (`Nt`).
 	const TAG_LEN: usize;
+
+	/// Cached cipher state, derived from the key once at key-schedule
+	/// time. For ChaCha20-Poly1305 this stores the key (state is
+	/// re-initialized per call by the underlying primitive). For AES-GCM
+	/// this stores the expanded round keys + the precomputed `GHash` table —
+	/// the expensive part of every per-message call when the cipher is
+	/// reconstructed from raw bytes.
+	type Cipher;
+
+	/// Initialize the cached cipher state from a `KEY_LEN`-byte key.
+	fn init(key: &[u8]) -> Result<Self::Cipher, HpkeError>;
 }
 
 /// Marker subtrait for AEADs that actually encrypt (i.e. not export-only).
@@ -28,10 +44,22 @@ pub trait Aead: Sealed {
 /// otherwise-unreachable "wrong key length" path. This keeps `open` failures
 /// indistinguishable to an attacker regardless of failure cause.
 pub trait SealingAead: Aead {
-	/// Encrypt `pt` with `key`, `nonce`, and `aad`. Output is `pt.len() + TAG_LEN` bytes.
-	fn seal(key: &[u8], nonce: &[u8], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, HpkeError>;
-	/// Decrypt `ct` (which includes the tag) with `key`, `nonce`, and `aad`.
-	fn open(key: &[u8], nonce: &[u8], aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, HpkeError>;
+	/// Encrypt `pt` with the cached `cipher` state, `nonce`, and `aad`.
+	/// Output is `pt.len() + TAG_LEN` bytes.
+	fn seal(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		pt: &[u8],
+	) -> Result<Vec<u8>, HpkeError>;
+	/// Decrypt `ct` (which includes the tag) with the cached `cipher`
+	/// state, `nonce`, and `aad`.
+	fn open(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		ct: &[u8],
+	) -> Result<Vec<u8>, HpkeError>;
 }
 
 /// ChaCha20-Poly1305 (RFC 9180 §7.3, ID `0x0003`).
@@ -44,30 +72,42 @@ impl Aead for ChaCha20Poly1305 {
 	const KEY_LEN: usize = 32;
 	const NONCE_LEN: usize = 12;
 	const TAG_LEN: usize = 16;
+
+	type Cipher = chacha20poly1305::ChaCha20Poly1305;
+
+	fn init(key: &[u8]) -> Result<Self::Cipher, HpkeError> {
+		use chacha20poly1305::KeyInit;
+		chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
+			.map_err(|_| HpkeError::AeadInitError)
+	}
 }
 impl SealingAead for ChaCha20Poly1305 {
-	fn seal(key: &[u8], nonce: &[u8], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, HpkeError> {
+	fn seal(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		pt: &[u8],
+	) -> Result<Vec<u8>, HpkeError> {
 		use chacha20poly1305::{
-			KeyInit, Nonce,
+			Nonce,
 			aead::{Aead as _, Payload},
 		};
-		let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
-			.map_err(|_| HpkeError::SealError)?;
-		let nonce = Nonce::from_slice(nonce);
 		cipher
-			.encrypt(nonce, Payload { msg: pt, aad })
+			.encrypt(Nonce::from_slice(nonce), Payload { msg: pt, aad })
 			.map_err(|_| HpkeError::SealError)
 	}
-	fn open(key: &[u8], nonce: &[u8], aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, HpkeError> {
+	fn open(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		ct: &[u8],
+	) -> Result<Vec<u8>, HpkeError> {
 		use chacha20poly1305::{
-			KeyInit, Nonce,
+			Nonce,
 			aead::{Aead as _, Payload},
 		};
-		let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
-			.map_err(|_| HpkeError::OpenError)?;
-		let nonce = Nonce::from_slice(nonce);
 		cipher
-			.decrypt(nonce, Payload { msg: ct, aad })
+			.decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
 			.map_err(|_| HpkeError::OpenError)
 	}
 }
@@ -85,22 +125,35 @@ impl Aead for Aes128Gcm {
 	const KEY_LEN: usize = 16;
 	const NONCE_LEN: usize = 12;
 	const TAG_LEN: usize = 16;
+
+	type Cipher = aes_gcm::Aes128Gcm;
+
+	fn init(key: &[u8]) -> Result<Self::Cipher, HpkeError> {
+		use aes_gcm::KeyInit;
+		aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| HpkeError::AeadInitError)
+	}
 }
 impl SealingAead for Aes128Gcm {
-	fn seal(key: &[u8], nonce: &[u8], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, HpkeError> {
-		use aes_gcm::{KeyInit, aead::Aead as _};
-		let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| HpkeError::SealError)?;
-		let nonce = aes_gcm::Nonce::from_slice(nonce);
+	fn seal(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		pt: &[u8],
+	) -> Result<Vec<u8>, HpkeError> {
+		use aes_gcm::aead::Aead as _;
 		cipher
-			.encrypt(nonce, aead::Payload { msg: pt, aad })
+			.encrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: pt, aad })
 			.map_err(|_| HpkeError::SealError)
 	}
-	fn open(key: &[u8], nonce: &[u8], aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, HpkeError> {
-		use aes_gcm::{KeyInit, aead::Aead as _};
-		let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| HpkeError::OpenError)?;
-		let nonce = aes_gcm::Nonce::from_slice(nonce);
+	fn open(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		ct: &[u8],
+	) -> Result<Vec<u8>, HpkeError> {
+		use aes_gcm::aead::Aead as _;
 		cipher
-			.decrypt(nonce, aead::Payload { msg: ct, aad })
+			.decrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: ct, aad })
 			.map_err(|_| HpkeError::OpenError)
 	}
 }
@@ -117,22 +170,35 @@ impl Aead for Aes256Gcm {
 	const KEY_LEN: usize = 32;
 	const NONCE_LEN: usize = 12;
 	const TAG_LEN: usize = 16;
+
+	type Cipher = aes_gcm::Aes256Gcm;
+
+	fn init(key: &[u8]) -> Result<Self::Cipher, HpkeError> {
+		use aes_gcm::KeyInit;
+		aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|_| HpkeError::AeadInitError)
+	}
 }
 impl SealingAead for Aes256Gcm {
-	fn seal(key: &[u8], nonce: &[u8], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, HpkeError> {
-		use aes_gcm::{KeyInit, aead::Aead as _};
-		let cipher = aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|_| HpkeError::SealError)?;
-		let nonce = aes_gcm::Nonce::from_slice(nonce);
+	fn seal(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		pt: &[u8],
+	) -> Result<Vec<u8>, HpkeError> {
+		use aes_gcm::aead::Aead as _;
 		cipher
-			.encrypt(nonce, aead::Payload { msg: pt, aad })
+			.encrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: pt, aad })
 			.map_err(|_| HpkeError::SealError)
 	}
-	fn open(key: &[u8], nonce: &[u8], aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, HpkeError> {
-		use aes_gcm::{KeyInit, aead::Aead as _};
-		let cipher = aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|_| HpkeError::OpenError)?;
-		let nonce = aes_gcm::Nonce::from_slice(nonce);
+	fn open(
+		cipher: &Self::Cipher,
+		nonce: &[u8],
+		aad: &[u8],
+		ct: &[u8],
+	) -> Result<Vec<u8>, HpkeError> {
+		use aes_gcm::aead::Aead as _;
 		cipher
-			.decrypt(nonce, aead::Payload { msg: ct, aad })
+			.decrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: ct, aad })
 			.map_err(|_| HpkeError::OpenError)
 	}
 }
@@ -151,6 +217,12 @@ impl Aead for ExportOnly {
 	const KEY_LEN: usize = 0;
 	const NONCE_LEN: usize = 0;
 	const TAG_LEN: usize = 0;
+
+	type Cipher = ();
+
+	fn init(_key: &[u8]) -> Result<Self::Cipher, HpkeError> {
+		Ok(())
+	}
 }
 
 #[cfg(test)]
@@ -168,14 +240,15 @@ mod tests {
 		let pt = b"Ladies and Gentlemen of the class of '99: \
                    If I could offer you only one tip for the future, sunscreen would be it.";
 
-		let ct = ChaCha20Poly1305::seal(&key, &nonce, &aad, pt).unwrap();
-		let recovered = ChaCha20Poly1305::open(&key, &nonce, &aad, &ct).unwrap();
+		let cipher = ChaCha20Poly1305::init(&key).unwrap();
+		let ct = ChaCha20Poly1305::seal(&cipher, &nonce, &aad, pt).unwrap();
+		let recovered = ChaCha20Poly1305::open(&cipher, &nonce, &aad, &ct).unwrap();
 		assert_eq!(recovered, pt);
 
 		let mut bad = ct.clone();
 		bad[0] ^= 1;
 		assert_eq!(
-			ChaCha20Poly1305::open(&key, &nonce, &aad, &bad),
+			ChaCha20Poly1305::open(&cipher, &nonce, &aad, &bad),
 			Err(HpkeError::OpenError)
 		);
 	}
@@ -186,9 +259,10 @@ mod tests {
 		let nonce = [0u8; 12];
 		let aad = b"";
 		let pt = b"hello";
-		let ct = Aes128Gcm::seal(&key, &nonce, aad, pt).unwrap();
+		let cipher = Aes128Gcm::init(&key).unwrap();
+		let ct = Aes128Gcm::seal(&cipher, &nonce, aad, pt).unwrap();
 		assert_eq!(ct.len(), pt.len() + 16);
-		assert_eq!(Aes128Gcm::open(&key, &nonce, aad, &ct).unwrap(), pt);
+		assert_eq!(Aes128Gcm::open(&cipher, &nonce, aad, &ct).unwrap(), pt);
 	}
 
 	#[test]
@@ -196,14 +270,15 @@ mod tests {
 		let key = [0u8; 32];
 		let nonce = [0u8; 12];
 		let pt = b"world";
-		let ct = Aes256Gcm::seal(&key, &nonce, b"aad", pt).unwrap();
-		assert_eq!(Aes256Gcm::open(&key, &nonce, b"aad", &ct).unwrap(), pt);
+		let cipher = Aes256Gcm::init(&key).unwrap();
+		let ct = Aes256Gcm::seal(&cipher, &nonce, b"aad", pt).unwrap();
+		assert_eq!(Aes256Gcm::open(&cipher, &nonce, b"aad", &ct).unwrap(), pt);
 	}
 
 	#[test]
 	fn aes128gcm_rejects_bad_key_len() {
-		let r = Aes128Gcm::seal(&[0u8; 15], &[0u8; 12], b"", b"");
-		assert!(r.is_err());
+		let r = Aes128Gcm::init(&[0u8; 15]);
+		assert_eq!(r.err(), Some(HpkeError::AeadInitError));
 	}
 
 	#[test]
@@ -214,5 +289,7 @@ mod tests {
 		assert_eq!(ExportOnly::KEY_LEN, 0);
 		assert_eq!(ExportOnly::NONCE_LEN, 0);
 		assert_eq!(ExportOnly::TAG_LEN, 0);
+		// `init` accepts the empty key cleanly.
+		assert!(ExportOnly::init(&[]).is_ok());
 	}
 }

@@ -7,7 +7,7 @@ use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::HpkeError;
-use crate::kdf::{Kdf, labeled_expand, labeled_extract};
+use crate::kdf::{Kdf, labeled_expand, labeled_expand_pieces, labeled_extract};
 use crate::kem::{AuthKem, Kem};
 use crate::sealed::Sealed;
 
@@ -101,11 +101,43 @@ impl<D: DiffieHellman> AsRef<[u8]> for DhPublicKey<D> {
 	}
 }
 
-/// Private-key wrapper holding the curve's secret bytes.
-pub struct DhPrivateKey<D: DiffieHellman>(pub(crate) D::PrivateKey);
+/// Private-key wrapper holding the curve's secret bytes plus a cached
+/// serialization of the matching public key.
+///
+/// `pk_bytes` is populated at construction time so that subsequent `decap`
+/// / `auth_decap` / `auth_encap` operations can fold the recipient's own
+/// public key into `kem_context` without performing another base-point
+/// scalar multiplication. The recipient already knows their public key —
+/// caching it once is strictly cheaper than re-deriving it on every call.
+pub struct DhPrivateKey<D: DiffieHellman> {
+	pub(crate) sk: D::PrivateKey,
+	pub(crate) pk_bytes: Vec<u8>,
+}
+
+impl<D: DiffieHellman> DhPrivateKey<D> {
+	/// Build from a freshly-generated `(sk, pk)` pair. Avoids a second
+	/// `sk_to_pk` call when the public key is already in hand.
+	pub(crate) fn from_pair(sk: D::PrivateKey, pk: &D::PublicKey) -> Self {
+		Self {
+			pk_bytes: D::pk_to_bytes(pk),
+			sk,
+		}
+	}
+
+	/// Build from a private key alone, deriving the public key once.
+	/// Used by `sk_from_bytes` where only the secret-key bytes are present.
+	pub(crate) fn from_sk(sk: D::PrivateKey) -> Self {
+		let pk = D::sk_to_pk(&sk);
+		Self {
+			pk_bytes: D::pk_to_bytes(&pk),
+			sk,
+		}
+	}
+}
+
 impl<D: DiffieHellman> Zeroize for DhPrivateKey<D> {
 	fn zeroize(&mut self) {
-		self.0.zeroize();
+		self.sk.zeroize();
 	}
 }
 impl<D: DiffieHellman> ZeroizeOnDrop for DhPrivateKey<D> {}
@@ -152,12 +184,12 @@ fn suite_id<D: DiffieHellman>() -> [u8; 5] {
 
 fn extract_and_expand<D: DiffieHellman, H: Kdf>(
 	dh: &[u8],
-	kem_context: &[u8],
+	kem_context: &[&[u8]],
 ) -> Result<Vec<u8>, HpkeError> {
 	let suite = suite_id::<D>();
 	// `eae_prk` is the PRK derived from the raw DH output; treat it as secret.
 	let eae_prk = Zeroizing::new(labeled_extract::<H>(&[], &suite, b"eae_prk", dh));
-	labeled_expand::<H>(
+	labeled_expand_pieces::<H>(
 		&eae_prk,
 		&suite,
 		b"shared_secret",
@@ -354,12 +386,14 @@ impl<D: DiffieHellman, H: Kdf> Kem for DhKem<D, H> {
 		rng: &mut R,
 	) -> Result<(Self::PrivateKey, Self::PublicKey), HpkeError> {
 		let (sk, pk) = D::generate(rng);
-		Ok((DhPrivateKey(sk), DhPublicKey(pk)))
+		let dh_sk = DhPrivateKey::<D>::from_pair(sk, &pk);
+		Ok((dh_sk, DhPublicKey(pk)))
 	}
 
 	fn derive_key_pair(ikm: &[u8]) -> Result<(Self::PrivateKey, Self::PublicKey), HpkeError> {
 		let (sk, pk) = D::derive(ikm)?;
-		Ok((DhPrivateKey(sk), DhPublicKey(pk)))
+		let dh_sk = DhPrivateKey::<D>::from_pair(sk, &pk);
+		Ok((dh_sk, DhPublicKey(pk)))
 	}
 
 	fn encap<R: CryptoRng + RngCore>(
@@ -374,19 +408,21 @@ impl<D: DiffieHellman, H: Kdf> Kem for DhKem<D, H> {
 		sk_r: &Self::PrivateKey,
 	) -> Result<Self::SharedSecret, HpkeError> {
 		let pk_e = D::pk_from_bytes(&enc.0)?;
-		let dh = Zeroizing::new(D::dh(&sk_r.0, &pk_e)?);
-		let pk_rm = D::pk_to_bytes(&D::sk_to_pk(&sk_r.0));
-		let mut kem_ctx = Vec::with_capacity(enc.0.len() + pk_rm.len());
-		kem_ctx.extend_from_slice(&enc.0);
-		kem_ctx.extend_from_slice(&pk_rm);
-		Ok(DhSharedSecret(extract_and_expand::<D, H>(&dh, &kem_ctx)?))
+		let dh = Zeroizing::new(D::dh(&sk_r.sk, &pk_e)?);
+		// `sk_r.pk_bytes` was cached at construction time; using it here
+		// saves the base-point scalar mult that `sk_to_pk` would otherwise
+		// perform on every decap.
+		Ok(DhSharedSecret(extract_and_expand::<D, H>(
+			&dh,
+			&[&enc.0, &sk_r.pk_bytes],
+		)?))
 	}
 
 	fn pk_from_bytes(b: &[u8]) -> Result<Self::PublicKey, HpkeError> {
 		Ok(DhPublicKey(D::pk_from_bytes(b)?))
 	}
 	fn sk_from_bytes(b: &[u8]) -> Result<Self::PrivateKey, HpkeError> {
-		Ok(DhPrivateKey(D::sk_from_bytes(b)?))
+		Ok(DhPrivateKey::<D>::from_sk(D::sk_from_bytes(b)?))
 	}
 	fn enc_from_bytes(b: &[u8]) -> Result<Self::EncappedKey, HpkeError> {
 		if b.len() != D::PUBLIC_KEY_LEN {
@@ -398,7 +434,7 @@ impl<D: DiffieHellman, H: Kdf> Kem for DhKem<D, H> {
 		D::pk_to_bytes(&pk.0)
 	}
 	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
-		D::sk_to_bytes(&sk.0)
+		D::sk_to_bytes(&sk.sk)
 	}
 }
 
@@ -408,7 +444,7 @@ impl<D: DiffieHellman, H: Kdf> AuthKem for DhKem<D, H> {
 		pk_r: &Self::PublicKey,
 		sk_s: &Self::PrivateKey,
 	) -> Result<(Self::SharedSecret, Self::EncappedKey), HpkeError> {
-		encap_with::<D, H, R>(rng, pk_r, Some(&sk_s.0))
+		encap_with::<D, H, R>(rng, pk_r, Some(sk_s))
 	}
 
 	fn auth_decap(
@@ -417,54 +453,43 @@ impl<D: DiffieHellman, H: Kdf> AuthKem for DhKem<D, H> {
 		pk_s: &Self::PublicKey,
 	) -> Result<Self::SharedSecret, HpkeError> {
 		let pk_e = D::pk_from_bytes(&enc.0)?;
-		let dh1 = Zeroizing::new(D::dh(&sk_r.0, &pk_e)?);
-		let dh2 = Zeroizing::new(D::dh(&sk_r.0, &pk_s.0)?);
+		let dh1 = Zeroizing::new(D::dh(&sk_r.sk, &pk_e)?);
+		let dh2 = Zeroizing::new(D::dh(&sk_r.sk, &pk_s.0)?);
 		let mut dh = Zeroizing::new(Vec::with_capacity(dh1.len() + dh2.len()));
 		dh.extend_from_slice(&dh1);
 		dh.extend_from_slice(&dh2);
 
-		let pk_recipient = D::pk_to_bytes(&D::sk_to_pk(&sk_r.0));
+		// Cached `sk_r.pk_bytes` replaces a per-call base-point scalar mult.
 		let pk_sender = D::pk_to_bytes(&pk_s.0);
-		let mut kem_ctx = Vec::with_capacity(enc.0.len() + pk_recipient.len() + pk_sender.len());
-		kem_ctx.extend_from_slice(&enc.0);
-		kem_ctx.extend_from_slice(&pk_recipient);
-		kem_ctx.extend_from_slice(&pk_sender);
-		Ok(DhSharedSecret(extract_and_expand::<D, H>(&dh, &kem_ctx)?))
+		Ok(DhSharedSecret(extract_and_expand::<D, H>(
+			&dh,
+			&[&enc.0, &sk_r.pk_bytes, &pk_sender],
+		)?))
 	}
 }
 
 fn encap_with<D: DiffieHellman, H: Kdf, R: CryptoRng + RngCore>(
 	rng: &mut R,
 	pk_r: &DhPublicKey<D>,
-	sk_s_authed: Option<&D::PrivateKey>,
+	sk_s_authed: Option<&DhPrivateKey<D>>,
 ) -> Result<(DhSharedSecret, DhEncappedKey), HpkeError> {
 	let (sk_e, pk_e) = D::generate(rng);
 	let dh1 = Zeroizing::new(D::dh(&sk_e, &pk_r.0)?);
 	let enc = D::pk_to_bytes(&pk_e);
 	let pk_recipient = D::pk_to_bytes(&pk_r.0);
 
-	let (dh, kem_ctx) = match sk_s_authed {
-		None => {
-			let mut ctx = Vec::with_capacity(enc.len() + pk_recipient.len());
-			ctx.extend_from_slice(&enc);
-			ctx.extend_from_slice(&pk_recipient);
-			(dh1, ctx)
-		}
+	let ss = match sk_s_authed {
+		None => extract_and_expand::<D, H>(&dh1, &[&enc, &pk_recipient])?,
 		Some(sk_s) => {
-			let dh2 = Zeroizing::new(D::dh(sk_s, &pk_r.0)?);
+			let dh2 = Zeroizing::new(D::dh(&sk_s.sk, &pk_r.0)?);
 			let mut dh = Zeroizing::new(Vec::with_capacity(dh1.len() + dh2.len()));
 			dh.extend_from_slice(&dh1);
 			dh.extend_from_slice(&dh2);
-			let pk_sender = D::pk_to_bytes(&D::sk_to_pk(sk_s));
-			let mut ctx = Vec::with_capacity(enc.len() + pk_recipient.len() + pk_sender.len());
-			ctx.extend_from_slice(&enc);
-			ctx.extend_from_slice(&pk_recipient);
-			ctx.extend_from_slice(&pk_sender);
-			(dh, ctx)
+			// Cached sender public-key bytes — no `sk_to_pk` round trip.
+			extract_and_expand::<D, H>(&dh, &[&enc, &pk_recipient, &sk_s.pk_bytes])?
 		}
 	};
 
-	let ss = extract_and_expand::<D, H>(&dh, &kem_ctx)?;
 	Ok((DhSharedSecret(ss), DhEncappedKey(enc)))
 }
 
@@ -480,11 +505,8 @@ pub(crate) fn encap_with_ikm<D: DiffieHellman, H: Kdf>(
 	let dh = Zeroizing::new(D::dh(&sk_e, &pk_r.0)?);
 	let enc = D::pk_to_bytes(&pk_e);
 	let pk_rm = D::pk_to_bytes(&pk_r.0);
-	let mut kem_ctx = Vec::with_capacity(enc.len() + pk_rm.len());
-	kem_ctx.extend_from_slice(&enc);
-	kem_ctx.extend_from_slice(&pk_rm);
 	Ok((
-		DhSharedSecret(extract_and_expand::<D, H>(&dh, &kem_ctx)?),
+		DhSharedSecret(extract_and_expand::<D, H>(&dh, &[&enc, &pk_rm])?),
 		DhEncappedKey(enc),
 	))
 }
@@ -493,24 +515,22 @@ pub(crate) fn encap_with_ikm<D: DiffieHellman, H: Kdf>(
 #[allow(dead_code)]
 pub(crate) fn auth_encap_with_ikm<D: DiffieHellman, H: Kdf>(
 	pk_r: &DhPublicKey<D>,
-	sk_s: &D::PrivateKey,
+	sk_s: &DhPrivateKey<D>,
 	ikm_e: &[u8],
 ) -> Result<(DhSharedSecret, DhEncappedKey), HpkeError> {
 	let (sk_e, pk_e) = D::derive(ikm_e)?;
 	let dh1 = Zeroizing::new(D::dh(&sk_e, &pk_r.0)?);
-	let dh2 = Zeroizing::new(D::dh(sk_s, &pk_r.0)?);
+	let dh2 = Zeroizing::new(D::dh(&sk_s.sk, &pk_r.0)?);
 	let mut dh = Zeroizing::new(Vec::with_capacity(dh1.len() + dh2.len()));
 	dh.extend_from_slice(&dh1);
 	dh.extend_from_slice(&dh2);
 	let enc = D::pk_to_bytes(&pk_e);
 	let pk_recipient = D::pk_to_bytes(&pk_r.0);
-	let pk_sender = D::pk_to_bytes(&D::sk_to_pk(sk_s));
-	let mut ctx = Vec::with_capacity(enc.len() + pk_recipient.len() + pk_sender.len());
-	ctx.extend_from_slice(&enc);
-	ctx.extend_from_slice(&pk_recipient);
-	ctx.extend_from_slice(&pk_sender);
 	Ok((
-		DhSharedSecret(extract_and_expand::<D, H>(&dh, &ctx)?),
+		DhSharedSecret(extract_and_expand::<D, H>(
+			&dh,
+			&[&enc, &pk_recipient, &sk_s.pk_bytes],
+		)?),
 		DhEncappedKey(enc),
 	))
 }
@@ -531,7 +551,7 @@ impl<D: DiffieHellman, H: Kdf> DhKem<D, H> {
 		sk_s: &<Self as Kem>::PrivateKey,
 		ikm_e: &[u8],
 	) -> Result<(<Self as Kem>::SharedSecret, <Self as Kem>::EncappedKey), HpkeError> {
-		auth_encap_with_ikm::<D, H>(pk_r, &sk_s.0, ikm_e)
+		auth_encap_with_ikm::<D, H>(pk_r, sk_s, ikm_e)
 	}
 }
 
@@ -557,6 +577,13 @@ impl DiffieHellman for X25519 {
 	fn generate<R: CryptoRng + RngCore>(rng: &mut R) -> (Self::PrivateKey, Self::PublicKey) {
 		let mut bytes = Zeroizing::new([0u8; 32]);
 		rng.fill_bytes(&mut bytes[..]);
+		// RFC 7748 §5: store the X25519 scalar in clamped final form so that
+		// `sk_to_bytes` returns a canonical representation. `mul_clamped` in
+		// `diffie_hellman` re-applies clamping at use time; clamping here is
+		// idempotent and only normalizes the stored byte representation.
+		bytes[0] &= 0xF8;
+		bytes[31] &= 0x7F;
+		bytes[31] |= 0x40;
 		let sk = x25519_dalek::StaticSecret::from(*bytes);
 		let pk = x25519_dalek::PublicKey::from(&sk);
 		(X25519PrivateKeyWrap(sk), X25519PublicKeyWrap(pk.to_bytes()))
@@ -579,6 +606,11 @@ impl DiffieHellman for X25519 {
 		)?);
 		let mut arr = Zeroizing::new([0u8; 32]);
 		arr.copy_from_slice(&sk_bytes);
+		// RFC 7748 §5: store the X25519 scalar in clamped final form. See the
+		// matching clamp in `generate`.
+		arr[0] &= 0xF8;
+		arr[31] &= 0x7F;
+		arr[31] |= 0x40;
 		let sk = x25519_dalek::StaticSecret::from(*arr);
 		let pk = x25519_dalek::PublicKey::from(&sk);
 		Ok((X25519PrivateKeyWrap(sk), X25519PublicKeyWrap(pk.to_bytes())))
@@ -909,30 +941,13 @@ mod tests {
 	use super::*;
 	use rand_core::{OsRng, TryRngCore as _};
 
-	#[test]
-	fn dhkem_x25519_sha256_roundtrip() {
-		type Suite = DhKem<X25519, crate::HkdfSha256>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 32);
-	}
+	// Roundtrip and auth-roundtrip coverage lives in `tests/roundtrip.rs`
+	// (one `#[test]` per `(mode, KEM, KDF, AEAD)` combination via macro).
+	// The tests below cover behaviours that aren't expressible there:
+	// rejection paths, RFC-mandated input transforms, type-system asserts.
 
-	#[test]
-	fn dhkem_x25519_auth_roundtrip() {
-		type Suite = DhKem<X25519, crate::HkdfSha256>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::auth_encap(&mut rng, &pk_r, &sk_s).unwrap();
-		let ss_d = Suite::auth_decap(&enc, &sk_r, &pk_s).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
-
+	/// RFC 9180 §7.1.4: an all-zeros DH output (small-order pk → zero
+	/// shared secret) MUST be rejected in constant time.
 	#[test]
 	fn x25519_rejects_small_order_zero_pk() {
 		type Suite = DhKem<X25519, crate::HkdfSha256>;
@@ -942,83 +957,9 @@ mod tests {
 		assert_eq!(r.err(), Some(HpkeError::EncapError));
 	}
 
-	#[test]
-	fn dhkem_p256_sha256_roundtrip() {
-		type Suite = DhKem<P256, crate::HkdfSha256>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 32);
-		assert_eq!(enc.as_ref().len(), 65);
-	}
-
-	#[test]
-	fn dhkem_p256_auth_roundtrip() {
-		type Suite = DhKem<P256, crate::HkdfSha256>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::auth_encap(&mut rng, &pk_r, &sk_s).unwrap();
-		let ss_d = Suite::auth_decap(&enc, &sk_r, &pk_s).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
-
-	#[test]
-	fn dhkem_p384_sha384_roundtrip() {
-		type Suite = DhKem<P384, crate::HkdfSha384>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 48);
-		assert_eq!(enc.as_ref().len(), 97);
-	}
-
-	#[test]
-	fn dhkem_p521_sha512_roundtrip() {
-		type Suite = DhKem<P521, crate::HkdfSha512>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 64);
-		assert_eq!(enc.as_ref().len(), 133);
-	}
-
-	#[test]
-	fn dhkem_k256_sha256_roundtrip() {
-		type Suite = DhKem<K256, crate::HkdfSha256>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
-
-	#[test]
-	fn dhkem_x448_sha512_roundtrip() {
-		type Suite = DhKem<X448, crate::HkdfSha512>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 64);
-	}
-
-	/// Behavioural test for X448 clamping in `sk_from_bytes`: load the same
-	/// scalar with and without manual pre-clamping; `sk_to_pk` and `dh` must
-	/// agree on both, proving the unclamped wire bytes were clamped on load.
+	/// RFC 7748 §5: load the same X448 scalar with and without pre-clamping;
+	/// `sk_to_pk` and `dh` must agree on both, proving wire bytes are
+	/// clamped on load.
 	#[test]
 	fn x448_sk_from_bytes_clamps_per_rfc7748() {
 		let mut unclamped = [0x55u8; 56];
@@ -1027,25 +968,18 @@ mod tests {
 		let mut clamped = unclamped;
 		clamped[0] &= 0xFC;
 		clamped[55] |= 0x80;
-		assert_ne!(unclamped[0], clamped[0]);
-		assert_ne!(unclamped[55], clamped[55]);
-
-		let sk_unclamped = X448::sk_from_bytes(&unclamped).unwrap();
-		let sk_clamped = X448::sk_from_bytes(&clamped).unwrap();
-		assert_eq!(
-			X448::sk_to_pk(&sk_unclamped).as_ref(),
-			X448::sk_to_pk(&sk_clamped).as_ref(),
-		);
-
+		let sk_u = X448::sk_from_bytes(&unclamped).unwrap();
+		let sk_c = X448::sk_from_bytes(&clamped).unwrap();
+		assert_eq!(X448::sk_to_pk(&sk_u).as_ref(), X448::sk_to_pk(&sk_c).as_ref());
 		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (_sk_peer, pk_peer) = X448::generate(&mut rng);
+		let (_, pk_peer) = X448::generate(&mut os_rng.unwrap_mut());
 		assert_eq!(
-			X448::dh(&sk_unclamped, &pk_peer).unwrap(),
-			X448::dh(&sk_clamped, &pk_peer).unwrap(),
+			X448::dh(&sk_u, &pk_peer).unwrap(),
+			X448::dh(&sk_c, &pk_peer).unwrap(),
 		);
 	}
 
+	/// All public `DhKem` aliases satisfy both `Kem` and `AuthKem`. Compile-only.
 	#[test]
 	fn aliases_implement_kem_and_authkem() {
 		fn assert_both<K: Kem + AuthKem>() {}
@@ -1057,213 +991,118 @@ mod tests {
 		assert_both::<DhKemX448HkdfSha512>();
 	}
 
-	/// RFC 7748 §5 mandates masking bit 7 of byte 31 on receive. Without this,
-	/// a sender holding a `pk_r` with the high bit set computes a different
-	/// `kem_context` than a receiver who derives `pk_r` from `sk_r` (which is
-	/// always canonical with bit 255 = 0).
+	/// RFC 7748 §5 mandates masking bit 7 of byte 31 on receive: a sender
+	/// holding a `pk_r` with the high bit set must compute the same
+	/// `kem_context` as a receiver deriving `pk_r` from `sk_r`.
 	#[test]
 	fn x25519_pk_from_bytes_masks_high_bit() {
 		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (_, pk_canonical) = X25519::generate(&mut rng);
+		let (_, pk_c) = X25519::generate(&mut os_rng.unwrap_mut());
 		let mut tampered = [0u8; 32];
-		tampered.copy_from_slice(pk_canonical.as_ref());
+		tampered.copy_from_slice(pk_c.as_ref());
 		tampered[31] |= 0x80;
-		let pk_loaded = X25519::pk_from_bytes(&tampered).unwrap();
-		assert_eq!(pk_loaded.as_ref(), pk_canonical.as_ref());
+		assert_eq!(X25519::pk_from_bytes(&tampered).unwrap().as_ref(), pk_c.as_ref());
 	}
 
-	// RFC 9180 §7.1.1 — for P-256, P-384, P-521, secp256k1, DeserializePublicKey
-	// is the *uncompressed* SEC1 conversion. Compressed (0x02/0x03) and compact
-	// (0x05) tags MUST be rejected even though `from_sec1_bytes` would accept
-	// them; the kem_context binding then depends on a canonical encoding.
+	/// RFC 9180 §7.1.1: NIST/secp256k1 `DeserializePublicKey` is the
+	/// uncompressed SEC1 form. Compressed (0x02/0x03) and hybrid (0x06/0x07)
+	/// tags MUST be rejected for canonical `kem_context` binding.
+	macro_rules! pk_rejection_test {
+		($name:ident, $curve:ty, $cn:ident, $clen:expr) => {
+			#[test]
+			fn $name() {
+				use $cn::elliptic_curve::sec1::ToEncodedPoint;
+				let mut os_rng = OsRng;
+				let (_, pk) = <$curve>::generate(&mut os_rng.unwrap_mut());
+				let compressed = pk.pk.to_encoded_point(true);
+				assert_eq!(compressed.as_bytes().len(), $clen);
+				assert!(matches!(
+					<$curve>::pk_from_bytes(compressed.as_bytes()),
+					Err(HpkeError::InvalidPublicKey)
+				));
+			}
+		};
+	}
+	pk_rejection_test!(p256_pk_from_bytes_rejects_compressed, P256, p256, 33);
+	pk_rejection_test!(p384_pk_from_bytes_rejects_compressed, P384, p384, 49);
+	pk_rejection_test!(p521_pk_from_bytes_rejects_compressed, P521, p521, 67);
+	pk_rejection_test!(k256_pk_from_bytes_rejects_compressed, K256, k256, 33);
 
+	/// Wrong-length and wrong-tag inputs must all be rejected before
+	/// reaching the curve library. Tested on P-256; the rejection logic
+	/// is shared across all four NIST/secp256k1 curves via the macro.
 	#[test]
-	fn p256_pk_from_bytes_rejects_compressed() {
+	fn p256_pk_from_bytes_rejects_wrong_length_and_tag() {
 		use p256::elliptic_curve::sec1::ToEncodedPoint;
+		for bad in [&[][..], &[0u8], &[0u8; 64], &[0u8; 66]] {
+			assert!(matches!(P256::pk_from_bytes(bad), Err(HpkeError::InvalidPublicKey)));
+		}
 		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (_, pk) = P256::generate(&mut rng);
-		let compressed = pk.pk.to_encoded_point(true);
-		assert_eq!(compressed.as_bytes().len(), 33);
-		assert!(matches!(
-			P256::pk_from_bytes(compressed.as_bytes()),
-			Err(HpkeError::InvalidPublicKey)
-		));
-	}
-
-	#[test]
-	fn p384_pk_from_bytes_rejects_compressed() {
-		use p384::elliptic_curve::sec1::ToEncodedPoint;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (_, pk) = P384::generate(&mut rng);
-		let compressed = pk.pk.to_encoded_point(true);
-		assert_eq!(compressed.as_bytes().len(), 49);
-		assert!(matches!(
-			P384::pk_from_bytes(compressed.as_bytes()),
-			Err(HpkeError::InvalidPublicKey)
-		));
-	}
-
-	#[test]
-	fn p521_pk_from_bytes_rejects_compressed() {
-		use p521::elliptic_curve::sec1::ToEncodedPoint;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (_, pk) = P521::generate(&mut rng);
-		let compressed = pk.pk.to_encoded_point(true);
-		assert_eq!(compressed.as_bytes().len(), 67);
-		assert!(matches!(
-			P521::pk_from_bytes(compressed.as_bytes()),
-			Err(HpkeError::InvalidPublicKey)
-		));
-	}
-
-	#[test]
-	fn k256_pk_from_bytes_rejects_compressed() {
-		use k256::elliptic_curve::sec1::ToEncodedPoint;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (_, pk) = K256::generate(&mut rng);
-		let compressed = pk.pk.to_encoded_point(true);
-		assert_eq!(compressed.as_bytes().len(), 33);
-		assert!(matches!(
-			K256::pk_from_bytes(compressed.as_bytes()),
-			Err(HpkeError::InvalidPublicKey)
-		));
-	}
-
-	/// Wrong-length inputs — short, oversized, identity tag (1-byte 0x00) —
-	/// must all be rejected before reaching the curve library.
-	#[test]
-	fn p256_pk_from_bytes_rejects_wrong_length() {
-		assert!(matches!(
-			P256::pk_from_bytes(&[]),
-			Err(HpkeError::InvalidPublicKey)
-		));
-		assert!(matches!(
-			P256::pk_from_bytes(&[0u8]),
-			Err(HpkeError::InvalidPublicKey)
-		));
-		assert!(matches!(
-			P256::pk_from_bytes(&[0u8; 64]),
-			Err(HpkeError::InvalidPublicKey)
-		));
-		assert!(matches!(
-			P256::pk_from_bytes(&[0u8; 66]),
-			Err(HpkeError::InvalidPublicKey)
-		));
-	}
-
-	/// Right length but wrong tag byte (anything other than 0x04) must fail.
-	#[test]
-	fn p256_pk_from_bytes_rejects_wrong_tag() {
-		use p256::elliptic_curve::sec1::ToEncodedPoint;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (_, pk) = P256::generate(&mut rng);
+		let (_, pk) = P256::generate(&mut os_rng.unwrap_mut());
 		let mut tampered = pk.pk.to_encoded_point(false).as_bytes().to_vec();
-		assert_eq!(tampered.len(), 65);
-		assert_eq!(tampered[0], 0x04);
-		// Hybrid (0x06/0x07) has the same length as uncompressed but is not
-		// `Tag::Uncompressed`. RFC 9180 says uncompressed-only.
-		tampered[0] = 0x06;
-		assert!(matches!(
-			P256::pk_from_bytes(&tampered),
-			Err(HpkeError::InvalidPublicKey)
-		));
-		tampered[0] = 0x07;
-		assert!(matches!(
-			P256::pk_from_bytes(&tampered),
-			Err(HpkeError::InvalidPublicKey)
-		));
+		// Hybrid (0x06/0x07) has the right length but is not `Tag::Uncompressed`.
+		for tag in [0x06, 0x07] {
+			tampered[0] = tag;
+			assert!(matches!(P256::pk_from_bytes(&tampered), Err(HpkeError::InvalidPublicKey)));
+		}
 	}
 
-	/// `sk_to_bytes` ∘ `sk_from_bytes` must roundtrip: a derived sk re-loaded from
-	/// its serialized bytes must produce the same shared secret on encap/decap.
-	/// The byte length must equal `PRIVATE_KEY_LEN`.
+	/// `sk_to_bytes` ∘ `sk_from_bytes` roundtrips on every curve: a serialized
+	/// sk re-loaded must produce the same shared secret on encap/decap.
+	macro_rules! sk_roundtrip_test {
+		($name:ident, $curve:ty, $kdf:ty) => {
+			#[test]
+			fn $name() {
+				type Suite = DhKem<$curve, $kdf>;
+				let mut os_rng = OsRng;
+				let mut rng = os_rng.unwrap_mut();
+				let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
+				let sk_bytes = Suite::sk_to_bytes(&sk_r);
+				assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
+				let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
+				let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
+				let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
+				assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+			}
+		};
+	}
+	sk_roundtrip_test!(x25519_sk_to_bytes_roundtrip, X25519, crate::HkdfSha256);
+	sk_roundtrip_test!(p256_sk_to_bytes_roundtrip, P256, crate::HkdfSha256);
+	sk_roundtrip_test!(p384_sk_to_bytes_roundtrip, P384, crate::HkdfSha384);
+	sk_roundtrip_test!(p521_sk_to_bytes_roundtrip, P521, crate::HkdfSha512);
+	sk_roundtrip_test!(k256_sk_to_bytes_roundtrip, K256, crate::HkdfSha256);
+	sk_roundtrip_test!(x448_sk_to_bytes_roundtrip, X448, crate::HkdfSha512);
+
+	/// RFC 7748 §5: `generate` and `derive` MUST store the X25519 scalar in
+	/// clamped final form so that `sk_to_bytes` is canonical. Without this,
+	/// `sk_to_bytes(generate(...))` and `sk_to_bytes(sk_from_bytes(...))`
+	/// returned different bytes for the same underlying scalar.
 	#[test]
-	fn x25519_sk_to_bytes_roundtrip() {
+	fn x25519_sk_serialization_is_canonical() {
+		fn assert_clamped(bytes: &[u8]) {
+			assert_eq!(bytes[0] & 0x07, 0, "low 3 bits of byte 0 must be cleared");
+			assert_eq!(bytes[31] & 0x80, 0, "high bit of byte 31 must be cleared");
+			assert_eq!(bytes[31] & 0x40, 0x40, "bit 6 of byte 31 must be set");
+		}
+
 		type Suite = DhKem<X25519, crate::HkdfSha256>;
 		let mut os_rng = OsRng;
 		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let sk_bytes = Suite::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
-		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
 
-	#[test]
-	fn p256_sk_to_bytes_roundtrip() {
-		type Suite = DhKem<P256, crate::HkdfSha256>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let sk_bytes = Suite::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
-		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
+		// `generate` produces clamped storage.
+		let (sk_g, _) = Suite::generate(&mut rng).unwrap();
+		let bytes_g = Suite::sk_to_bytes(&sk_g);
+		assert_clamped(&bytes_g);
 
-	#[test]
-	fn p384_sk_to_bytes_roundtrip() {
-		type Suite = DhKem<P384, crate::HkdfSha384>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let sk_bytes = Suite::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
-		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
+		// `derive` produces clamped storage.
+		let (sk_d, _) = Suite::derive_key_pair(b"hpke-ng x25519 canonical test").unwrap();
+		let bytes_d = Suite::sk_to_bytes(&sk_d);
+		assert_clamped(&bytes_d);
 
-	#[test]
-	fn p521_sk_to_bytes_roundtrip() {
-		type Suite = DhKem<P521, crate::HkdfSha512>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let sk_bytes = Suite::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
-		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
-
-	#[test]
-	fn k256_sk_to_bytes_roundtrip() {
-		type Suite = DhKem<K256, crate::HkdfSha256>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let sk_bytes = Suite::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
-		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
-
-	#[test]
-	fn x448_sk_to_bytes_roundtrip() {
-		type Suite = DhKem<X448, crate::HkdfSha512>;
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = Suite::generate(&mut rng).unwrap();
-		let sk_bytes = Suite::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), Suite::PRIVATE_KEY_LEN);
-		let sk_loaded = Suite::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = Suite::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = Suite::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+		// Roundtrip is byte-stable on both paths.
+		let bytes_g2 = Suite::sk_to_bytes(&Suite::sk_from_bytes(&bytes_g).unwrap());
+		assert_eq!(bytes_g.as_slice(), bytes_g2.as_slice());
+		let bytes_d2 = Suite::sk_to_bytes(&Suite::sk_from_bytes(&bytes_d).unwrap());
+		assert_eq!(bytes_d.as_slice(), bytes_d2.as_slice());
 	}
 }

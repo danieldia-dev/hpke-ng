@@ -52,3 +52,10 @@ path  = "fuzz_targets/key_schedule.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "derive_key_pair"
+path  = "fuzz_targets/derive_key_pair.rs"
+test  = false
+doc   = false
+bench = false

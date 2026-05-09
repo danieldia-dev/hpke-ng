@@ -59,27 +59,40 @@ impl Sealed for XWingDraft06 {}
 
 /// Public (encapsulation) key for X-Wing.
 ///
-/// Wire format: 1184 bytes ML-KEM-768 encapsulation key || 32 bytes X25519 public key.
+/// Wire format: 1184 bytes ML-KEM-768 encapsulation key || 32 bytes X25519
+/// public key. The structured `EncapsulationKey` is materialized once at
+/// construction time so that repeated `encap` calls do not re-parse the
+/// 1216-byte wire form.
 #[derive(Clone, Debug)]
-pub struct XWingPublicKey(Vec<u8>);
+pub struct XWingPublicKey {
+	bytes: Vec<u8>,
+	parsed: x_wing::EncapsulationKey,
+}
 
 impl AsRef<[u8]> for XWingPublicKey {
 	fn as_ref(&self) -> &[u8] {
-		&self.0
+		&self.bytes
 	}
 }
 
-/// Private (decapsulation) key for X-Wing — a 32-byte seed.
+/// Private (decapsulation) key for X-Wing.
 ///
-/// The full ML-KEM-768 and X25519 key material is derived from this seed
-/// via SHAKE-256 by the x-wing crate.
+/// Stores the canonical 32-byte seed plus a cached
+/// [`x_wing::DecapsulationKey`]. Caching the DK saves a SHAKE-256 expansion
+/// and ML-KEM-768 keygen on every `decap` call (the construction-side
+/// `expand_key` work). Wrapped in `Option` so `zeroize()` can drop the inner
+/// DK and trigger its own zeroize-on-drop.
 pub struct XWingPrivateKey {
 	seed: [u8; 32],
+	dk: Option<x_wing::DecapsulationKey>,
 }
 
 impl Zeroize for XWingPrivateKey {
 	fn zeroize(&mut self) {
 		self.seed.zeroize();
+		// Dropping the cached DK triggers its zeroize-on-drop (the x_wing
+		// crate scrubs the inner 32-byte sk under its `zeroize` feature).
+		self.dk = None;
 	}
 }
 
@@ -160,14 +173,13 @@ impl Kem for XWingDraft06 {
 		pk_r: &Self::PublicKey,
 	) -> Result<(Self::SharedSecret, Self::EncappedKey), HpkeError> {
 		use x_wing::Encapsulate;
-		let ek = x_wing::EncapsulationKey::try_from(pk_r.0.as_slice())
-			.map_err(|_| HpkeError::InvalidPublicKey)?;
 		let mut compat = RngCompat10(rng);
-		let (ct, ss) = ek.encapsulate_with_rng(&mut compat);
+		// Use the cached parsed `EncapsulationKey` directly — no per-call
+		// `try_from` over the 1216-byte wire form.
+		let (ct, ss) = pk_r.parsed.encapsulate_with_rng(&mut compat);
 		let mut ss_bytes = [0u8; 32];
 		ss_bytes.copy_from_slice(ss.as_ref());
-		let ct_vec: Vec<u8> = ct.iter().copied().collect();
-		Ok((XWingSharedSecret(ss_bytes), XWingEncappedKey(ct_vec)))
+		Ok((XWingSharedSecret(ss_bytes), XWingEncappedKey(ct.to_vec())))
 	}
 
 	fn decap(
@@ -175,7 +187,13 @@ impl Kem for XWingDraft06 {
 		sk_r: &Self::PrivateKey,
 	) -> Result<Self::SharedSecret, HpkeError> {
 		use x_wing::Decapsulate;
-		let dk = x_wing::DecapsulationKey::from(sk_r.seed);
+		// Cached DK: skips the per-call `expand_key` that
+		// `DecapsulationKey::from(seed)` performs at construction.
+		// `dk` is populated by every constructor and only cleared by
+		// `Zeroize::zeroize()`; reaching `decap` after a manual `zeroize`
+		// is a use-after-zeroize at the call site, so reject explicitly
+		// rather than panicking.
+		let dk = sk_r.dk.as_ref().ok_or(HpkeError::DecapError)?;
 		let ss = dk
 			.decapsulate_slice(enc.0.as_slice())
 			.map_err(|_| HpkeError::InvalidEncappedKey)?;
@@ -188,7 +206,12 @@ impl Kem for XWingDraft06 {
 		if b.len() != Self::PUBLIC_KEY_LEN {
 			return Err(HpkeError::InvalidPublicKey);
 		}
-		Ok(XWingPublicKey(b.to_vec()))
+		let parsed =
+			x_wing::EncapsulationKey::try_from(b).map_err(|_| HpkeError::InvalidPublicKey)?;
+		Ok(XWingPublicKey {
+			bytes: b.to_vec(),
+			parsed,
+		})
 	}
 
 	fn sk_from_bytes(b: &[u8]) -> Result<Self::PrivateKey, HpkeError> {
@@ -197,7 +220,8 @@ impl Kem for XWingDraft06 {
 		}
 		let mut seed = [0u8; 32];
 		seed.copy_from_slice(b);
-		Ok(XWingPrivateKey { seed })
+		let dk = x_wing::DecapsulationKey::from(seed);
+		Ok(XWingPrivateKey { seed, dk: Some(dk) })
 	}
 
 	fn enc_from_bytes(b: &[u8]) -> Result<Self::EncappedKey, HpkeError> {
@@ -208,7 +232,7 @@ impl Kem for XWingDraft06 {
 	}
 
 	fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8> {
-		pk.0.clone()
+		pk.bytes.clone()
 	}
 
 	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
@@ -216,15 +240,22 @@ impl Kem for XWingDraft06 {
 	}
 }
 
-/// Derive an X-Wing keypair from a 32-byte seed.
+/// Derive an X-Wing keypair from a 32-byte seed, caching the parsed
+/// decapsulation/encapsulation keys for fast subsequent use.
 fn keypair_from_seed(seed: [u8; 32]) -> (XWingPrivateKey, XWingPublicKey) {
 	use x_wing::{DecapsulationKey, Decapsulator, KeyExport};
 
 	let dk = DecapsulationKey::from(seed);
-	let ek = dk.encapsulation_key();
+	let ek = dk.encapsulation_key().clone();
 	let pk_bytes = ek.to_bytes().to_vec();
 
-	(XWingPrivateKey { seed }, XWingPublicKey(pk_bytes))
+	(
+		XWingPrivateKey { seed, dk: Some(dk) },
+		XWingPublicKey {
+			bytes: pk_bytes,
+			parsed: ek,
+		},
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,13 +304,16 @@ macro_rules! ml_kem_variant {
 
 		impl Sealed for $marker {}
 
-		#[doc = concat!("Public (encapsulation) key for `", $variant, "`.")]
+		#[doc = concat!("Public (encapsulation) key for `", $variant, "`. Parsed `EncapsulationKey` cached so `encap` skips the per-call decode of the wire bytes.")]
 		#[derive(Clone, Debug)]
-		pub struct $pk_wrap(Vec<u8>);
+		pub struct $pk_wrap {
+			bytes: Vec<u8>,
+			parsed: $ek,
+		}
 
 		impl AsRef<[u8]> for $pk_wrap {
 			fn as_ref(&self) -> &[u8] {
-				&self.0
+				&self.bytes
 			}
 		}
 
@@ -355,18 +389,11 @@ macro_rules! ml_kem_variant {
 				pk_r: &Self::PublicKey,
 			) -> Result<(Self::SharedSecret, Self::EncappedKey), HpkeError> {
 				use ml_kem::kem::Encapsulate as _;
-				let ek_bytes: ml_kem::kem::Key<$ek> = pk_r
-					.0
-					.as_slice()
-					.try_into()
-					.map_err(|_| HpkeError::InvalidPublicKey)?;
-				let ek = <$ek>::new(&ek_bytes).map_err(|_| HpkeError::InvalidPublicKey)?;
 				let mut compat = RngCompat10(rng);
-				let (ct, ss) = ek.encapsulate_with_rng(&mut compat);
-				Ok((
-					MlKemSharedSecret(ss.iter().copied().collect()),
-					$enc_wrap(ct.iter().copied().collect()),
-				))
+				// Cached parsed `EncapsulationKey` — no per-call `try_into`
+				// + `<$ek>::new` over the 1184/1568-byte wire form.
+				let (ct, ss) = pk_r.parsed.encapsulate_with_rng(&mut compat);
+				Ok((MlKemSharedSecret(ss.to_vec()), $enc_wrap(ct.to_vec())))
 			}
 
 			fn decap(
@@ -380,14 +407,22 @@ macro_rules! ml_kem_variant {
 					.try_into()
 					.map_err(|_| HpkeError::InvalidEncappedKey)?;
 				let ss = sk_r.dk.decapsulate(&ct);
-				Ok(MlKemSharedSecret(ss.iter().copied().collect()))
+				Ok(MlKemSharedSecret(ss.to_vec()))
 			}
 
 			fn pk_from_bytes(b: &[u8]) -> Result<Self::PublicKey, HpkeError> {
 				if b.len() != Self::PUBLIC_KEY_LEN {
 					return Err(HpkeError::InvalidPublicKey);
 				}
-				Ok($pk_wrap(b.to_vec()))
+				let ek_bytes: ml_kem::kem::Key<$ek> = b
+					.try_into()
+					.map_err(|_| HpkeError::InvalidPublicKey)?;
+				let parsed =
+					<$ek>::new(&ek_bytes).map_err(|_| HpkeError::InvalidPublicKey)?;
+				Ok($pk_wrap {
+					bytes: b.to_vec(),
+					parsed,
+				})
 			}
 
 			fn sk_from_bytes(b: &[u8]) -> Result<Self::PrivateKey, HpkeError> {
@@ -408,7 +443,7 @@ macro_rules! ml_kem_variant {
 			}
 
 			fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8> {
-				pk.0.clone()
+				pk.bytes.clone()
 			}
 
 			fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
@@ -420,9 +455,15 @@ macro_rules! ml_kem_variant {
 			use ml_kem::kem::KeyExport as _;
 			let ml_seed: ml_kem::Seed = seed.into();
 			let dk = <$dk>::from_seed(ml_seed);
-			let ek = dk.encapsulation_key();
-			let ek_bytes: Vec<u8> = ek.to_bytes().iter().copied().collect();
-			($sk_wrap { dk, seed }, $pk_wrap(ek_bytes))
+			let ek = dk.encapsulation_key().clone();
+			let ek_bytes: Vec<u8> = ek.to_bytes().to_vec();
+			(
+				$sk_wrap { dk, seed },
+				$pk_wrap {
+					bytes: ek_bytes,
+					parsed: ek,
+				},
+			)
 		}
 	};
 }
@@ -462,73 +503,50 @@ mod tests {
 	use super::*;
 	use rand_core::{OsRng, TryRngCore as _};
 
-	#[test]
-	fn xwing_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = XWingDraft06::generate(&mut rng).unwrap();
-		let (ss_e, enc) = XWingDraft06::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = XWingDraft06::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 32);
-		assert_eq!(enc.as_ref().len(), 1120);
-		assert_eq!(pk_r.as_ref().len(), 1216);
-	}
+	// Roundtrip coverage lives in `tests/roundtrip.rs`. The tests here cover
+	// behaviours that aren't expressible in the macro-generated matrix:
+	// derive-key-pair input validation, parameter-set domain separation,
+	// and seed-bytes round-tripping.
 
+	/// `sk_to_bytes` ∘ `sk_from_bytes` roundtrips on every PQ KEM.
+	macro_rules! sk_roundtrip_test {
+		($name:ident, $kem:ty, $seed_len:expr) => {
+			#[test]
+			fn $name() {
+				let mut os_rng = OsRng;
+				let mut rng = os_rng.unwrap_mut();
+				let (sk_r, pk_r) = <$kem>::generate(&mut rng).unwrap();
+				let sk_bytes = <$kem>::sk_to_bytes(&sk_r);
+				assert_eq!(sk_bytes.len(), $seed_len);
+				let sk_loaded = <$kem>::sk_from_bytes(&sk_bytes).unwrap();
+				let (ss_e, enc) = <$kem>::encap(&mut rng, &pk_r).unwrap();
+				let ss_d = <$kem>::decap(&enc, &sk_loaded).unwrap();
+				assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+			}
+		};
+	}
+	sk_roundtrip_test!(xwing_sk_to_bytes_roundtrip, XWingDraft06, 32);
+	sk_roundtrip_test!(ml_kem_768_sk_to_bytes_roundtrip, MlKem768, 64);
+	sk_roundtrip_test!(ml_kem_1024_sk_to_bytes_roundtrip, MlKem1024, 64);
+
+	/// X-Wing draft-06 specifies SHAKE-256(ikm, 32) for `DeriveKeyPair` —
+	/// any non-empty ikm yields a working key pair.
 	#[test]
 	fn xwing_derive_key_pair_roundtrip() {
-		let ikm = b"test input keying material for xwing derive";
-		let (sk_r, pk_r) = XWingDraft06::derive_key_pair(ikm).unwrap();
+		let (sk_r, pk_r) = XWingDraft06::derive_key_pair(b"x-wing test ikm").unwrap();
 		let mut os_rng = OsRng;
 		let mut rng = os_rng.unwrap_mut();
 		let (ss_e, enc) = XWingDraft06::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = XWingDraft06::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
+		assert_eq!(
+			XWingDraft06::decap(&enc, &sk_r).unwrap().as_ref(),
+			ss_e.as_ref(),
+		);
 	}
 
-	#[test]
-	fn xwing_sk_from_to_bytes() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = XWingDraft06::generate(&mut rng).unwrap();
-		let sk_bytes: [u8; 32] = sk_r.seed;
-		let sk_r2 = XWingDraft06::sk_from_bytes(&sk_bytes).unwrap();
-		let pk_bytes1 = XWingDraft06::pk_to_bytes(&pk_r);
-		let (_, pk_r2) = keypair_from_seed(sk_r2.seed);
-		let pk_bytes2 = XWingDraft06::pk_to_bytes(&pk_r2);
-		assert_eq!(pk_bytes1, pk_bytes2);
-	}
-
-	#[test]
-	fn ml_kem_768_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = MlKem768::generate(&mut rng).unwrap();
-		let (ss_e, enc) = MlKem768::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = MlKem768::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 32);
-		assert_eq!(enc.as_ref().len(), 1088);
-		assert_eq!(pk_r.as_ref().len(), 1184);
-	}
-
-	#[test]
-	fn ml_kem_1024_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = MlKem1024::generate(&mut rng).unwrap();
-		let (ss_e, enc) = MlKem1024::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = MlKem1024::decap(&enc, &sk_r).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-		assert_eq!(ss_e.as_ref().len(), 32);
-		assert_eq!(enc.as_ref().len(), 1568);
-		assert_eq!(pk_r.as_ref().len(), 1568);
-	}
-
-	/// Even with the same 64-byte (d, z) seed, ML-KEM-768 and ML-KEM-1024 produce
-	/// different keys: FIPS 203 Algorithm 13 mixes the parameter `k` (3 vs 4)
-	/// into G(d || k) when expanding the matrix seed and noise PRF, so the two
-	/// parameter sets are cryptographically independent for any shared seed.
+	/// Even with the same 64-byte (d, z) seed, ML-KEM-768 and ML-KEM-1024
+	/// produce different keys: FIPS 203 Algorithm 13 mixes the parameter `k`
+	/// (3 vs 4) into G(d || k), so the two parameter sets are
+	/// cryptographically independent for any shared seed.
 	#[test]
 	fn ml_kem_768_and_1024_derive_distinct_keys_from_same_ikm() {
 		let ikm = [0x5Au8; 64];
@@ -538,112 +556,26 @@ mod tests {
 		assert_ne!(&pk_768.as_ref()[..n], &pk_1024.as_ref()[..n]);
 	}
 
-	/// `MlKem768::derive_key_pair(ikm)` must be deterministic — the same ikm
-	/// always produces the same key pair.
-	#[test]
-	fn ml_kem_768_derive_is_deterministic() {
-		let ikm = [0x33u8; 64];
-		let (_, pk1) = MlKem768::derive_key_pair(&ikm).unwrap();
-		let (_, pk2) = MlKem768::derive_key_pair(&ikm).unwrap();
-		assert_eq!(pk1.as_ref(), pk2.as_ref());
+	/// `derive_key_pair(ikm)` is deterministic and stores `ikm` verbatim as
+	/// the (d, z) seed. draft-connolly-cfrg-hpke-mlkem-04 §3.2 mandates this.
+	macro_rules! ml_kem_derive_seed_test {
+		($name:ident, $kem:ty) => {
+			#[test]
+			fn $name() {
+				let ikm: [u8; 64] = core::array::from_fn(|i| u8::try_from(i).unwrap());
+				let (sk1, pk1) = <$kem>::derive_key_pair(&ikm).unwrap();
+				let (_, pk2) = <$kem>::derive_key_pair(&ikm).unwrap();
+				assert_eq!(pk1.as_ref(), pk2.as_ref());
+				assert_eq!(sk1.seed, ikm);
+				for bad_len in [0usize, 32, 63, 65] {
+					assert!(matches!(
+						<$kem>::derive_key_pair(&vec![0u8; bad_len]),
+						Err(HpkeError::DeriveKeyPairError)
+					));
+				}
+			}
+		};
 	}
-
-	/// draft-connolly-cfrg-hpke-mlkem-04 §3.2: `ikm` is the 64-byte (d, z) seed
-	/// passed to `ML-KEM.KeyGen_internal(d, z)`. Reject any other length.
-	#[test]
-	fn ml_kem_768_derive_rejects_non_64_byte_ikm() {
-		assert!(matches!(
-			MlKem768::derive_key_pair(b""),
-			Err(HpkeError::DeriveKeyPairError)
-		));
-		assert!(matches!(
-			MlKem768::derive_key_pair(&[0u8; 32]),
-			Err(HpkeError::DeriveKeyPairError)
-		));
-		assert!(matches!(
-			MlKem768::derive_key_pair(&[0u8; 63]),
-			Err(HpkeError::DeriveKeyPairError)
-		));
-		assert!(matches!(
-			MlKem768::derive_key_pair(&[0u8; 65]),
-			Err(HpkeError::DeriveKeyPairError)
-		));
-	}
-
-	/// Same as the 768 case for ML-KEM-1024.
-	#[test]
-	fn ml_kem_1024_derive_rejects_non_64_byte_ikm() {
-		assert!(matches!(
-			MlKem1024::derive_key_pair(b""),
-			Err(HpkeError::DeriveKeyPairError)
-		));
-		assert!(matches!(
-			MlKem1024::derive_key_pair(&[0u8; 63]),
-			Err(HpkeError::DeriveKeyPairError)
-		));
-		assert!(matches!(
-			MlKem1024::derive_key_pair(&[0u8; 65]),
-			Err(HpkeError::DeriveKeyPairError)
-		));
-	}
-
-	/// draft-connolly-cfrg-hpke-mlkem-04 §3.2 mandates that the 64-byte `ikm`
-	/// IS the (d, z) seed, with no transformation. Verify the seed stored in
-	/// the private key equals the input ikm exactly.
-	#[test]
-	fn ml_kem_768_derive_uses_ikm_as_seed_unchanged() {
-		let ikm: [u8; 64] = core::array::from_fn(|i| u8::try_from(i).unwrap());
-		let (sk, _) = MlKem768::derive_key_pair(&ikm).unwrap();
-		assert_eq!(sk.seed, ikm);
-	}
-
-	#[test]
-	fn ml_kem_1024_derive_uses_ikm_as_seed_unchanged() {
-		let ikm: [u8; 64] = core::array::from_fn(|i| u8::try_from(i).unwrap().wrapping_add(1));
-		let (sk, _) = MlKem1024::derive_key_pair(&ikm).unwrap();
-		assert_eq!(sk.seed, ikm);
-	}
-
-	/// `sk_to_bytes` returns the 32-byte X-Wing seed and roundtrips through
-	/// `sk_from_bytes` such that decap with the loaded key matches encap.
-	#[test]
-	fn xwing_sk_to_bytes_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = XWingDraft06::generate(&mut rng).unwrap();
-		let sk_bytes = XWingDraft06::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), 32);
-		let sk_loaded = XWingDraft06::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = XWingDraft06::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = XWingDraft06::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
-
-	/// `sk_to_bytes` returns the 64-byte (d, z) seed for ML-KEM-768; loading the
-	/// bytes back must rebuild the same expanded `dk`.
-	#[test]
-	fn ml_kem_768_sk_to_bytes_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = MlKem768::generate(&mut rng).unwrap();
-		let sk_bytes = MlKem768::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), 64);
-		let sk_loaded = MlKem768::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = MlKem768::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = MlKem768::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
-
-	#[test]
-	fn ml_kem_1024_sk_to_bytes_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = MlKem1024::generate(&mut rng).unwrap();
-		let sk_bytes = MlKem1024::sk_to_bytes(&sk_r);
-		assert_eq!(sk_bytes.len(), 64);
-		let sk_loaded = MlKem1024::sk_from_bytes(&sk_bytes).unwrap();
-		let (ss_e, enc) = MlKem1024::encap(&mut rng, &pk_r).unwrap();
-		let ss_d = MlKem1024::decap(&enc, &sk_loaded).unwrap();
-		assert_eq!(ss_e.as_ref(), ss_d.as_ref());
-	}
+	ml_kem_derive_seed_test!(ml_kem_768_derive_key_pair_seed_invariants, MlKem768);
+	ml_kem_derive_seed_test!(ml_kem_1024_derive_key_pair_seed_invariants, MlKem1024);
 }

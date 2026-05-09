@@ -17,6 +17,13 @@ pub enum HpkeError {
 	/// AEAD primitive is engineered not to fail on valid inputs. This variant
 	/// covers e.g. message-length overflow on the AEAD's internal counter.
 	SealError,
+	/// AEAD cipher state could not be initialized from a key.
+	///
+	/// Returned by [`Aead::init`](crate::Aead::init) when the supplied key
+	/// length does not match `Aead::KEY_LEN`. Unreachable in normal operation
+	/// because the key schedule produces keys of exactly the right length;
+	/// kept as a defense-in-depth boundary error.
+	AeadInitError,
 	/// KEM encapsulation failed (e.g. small-order receiver public key).
 	EncapError,
 	/// KEM decapsulation failed.
@@ -56,6 +63,7 @@ impl fmt::Display for HpkeError {
 		let s = match self {
 			Self::OpenError => "AEAD open failed",
 			Self::SealError => "AEAD seal failed",
+			Self::AeadInitError => "AEAD cipher init failed",
 			Self::EncapError => "KEM encapsulation failed",
 			Self::DecapError => "KEM decapsulation failed",
 			Self::InvalidPublicKey => "invalid public key",

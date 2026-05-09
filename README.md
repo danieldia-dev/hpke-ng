@@ -65,15 +65,20 @@ The design takes one position on each: **no provider abstraction, no owned RNG, 
 
 ## Performance
 
-Across 62 head-to-head benchmarks vs. `hpke-rs`: **27 wins** for `hpke-ng`, **32 ties** where the underlying primitive dominates, **3 losses** on isolated key-generation paths. The largest deltas are on the post-quantum decap path — ML-KEM-768 and ML-KEM-1024 land 54–55% faster because `hpke-ng` materializes the FIPS 203 decapsulation key once at construction while `hpke-rs` reconstructs it from the 64-byte seed on every `setup_receiver`. ML-KEM encap follows at 25–29%, X-Wing encap/decap at 11–16%, and X25519 encap/decap at 21–22%.
+Across 62 head-to-head benchmarks vs. `hpke-rs`: **43 wins** for `hpke-ng`, **14 ties** where the underlying primitive dominates, **5 losses** on isolated key-generation paths. The largest deltas are on the post-quantum decap path — ML-KEM-768 and ML-KEM-1024 land 53–55% faster, and X-Wing decap is 38% faster, because `hpke-ng` caches the expanded FIPS 203 decapsulation key in the `PrivateKey` while `hpke-rs` rebuilds it from the seed on every `setup_receiver`. The same idea applied to classical KEMs — caching the recipient's serialized public key alongside the secret — eliminates a redundant base-point scalar multiplication on every decap, lifting X25519 decap to 41% faster, X-Wing encap to 14%, ML-KEM encap to 30–37%. Single-shot open is 23–35% faster across payload sizes, AES-128-GCM single-shot seal 6–12% across payloads ≤ 16 KiB, post-setup `Context::seal` at 64 B is 15% faster, and 1 KiB end-to-end roundtrip is 20% faster.
 
 Memory and binary footprint:
 
-| Quantity                | hpke-rs   | hpke-ng   |
-|-------------------------|-----------|-----------|
-| `Hpke<...>` struct      | 320 bytes | **0 bytes** (`PhantomData`) |
-| `Context<...>` struct   | 400 bytes | **80 bytes** |
-| Minimal release binary  | 561 KB    | **392 KB** (~30% smaller) |
+| Quantity                                       | hpke-rs   | hpke-ng        |
+|------------------------------------------------|-----------|----------------|
+| `Hpke<K, F, A>` struct                         | 320 bytes | **0 bytes** (`PhantomData`) |
+| `Context<_, _, ChaCha20Poly1305>` struct       | 400 bytes | **88 bytes**   |
+| `Context<_, _, ExportOnly>` struct             | n/a       | **56 bytes**   |
+| `Context<_, _, Aes128Gcm>` struct              | 400 bytes | 792 bytes      |
+| `Context<_, _, Aes256Gcm>` struct              | 400 bytes | 1,048 bytes    |
+| Minimal release binary                         | 561 KB    | **392 KB** (~30% smaller) |
+
+The AES-GCM `Context` rows are larger than `hpke-rs` because the cipher's expanded round keys + GHash table are cached inline — that is what eliminates the per-call AES key-schedule cost in `Context::seal`. Streaming applications using AES-GCM trade memory for throughput here; ChaCha20-Poly1305 is unaffected.
 
 Build with `RUSTFLAGS="-C target-cpu=native"` for AES-NI / SHA-NI where available. The `[profile.bench]` in `Cargo.toml` enables `lto = "thin"` and `codegen-units = 1`. For head-to-head numbers, run `cargo bench --features comparative --bench comparative` locally; the comparative bench enables `hpke-rs-rust-crypto`'s `experimental` feature so the post-quantum KEM stubs are wired up on the `hpke-rs` side.
 

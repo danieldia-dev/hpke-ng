@@ -13,14 +13,21 @@ use crate::kem::Kem;
 
 /// HPKE encryption/decryption context.
 ///
-/// Holds the `key`/`base_nonce`/`exporter_secret` triple plus a sequence number.
+/// Holds an AEAD cipher state (constructed once from the derived key), the
+/// `base_nonce`, the `exporter_secret`, and a `u64` sequence counter.
+///
 /// **Not** `Clone`: copying a context would let two callers reuse the same
 /// `(key, base_nonce, seq)` and produce a nonce-reuse footgun.
 pub struct Context<K: Kem, F: Kdf, A: Aead> {
-	key: Zeroizing<Vec<u8>>,
+	cipher: A::Cipher,
 	base_nonce: Zeroizing<Vec<u8>>,
 	exporter_secret: Zeroizing<Vec<u8>>,
 	seq: u64,
+	/// Raw AEAD key bytes — kept under cfg gate so the test/KAT/differential
+	/// harnesses can assert on them. Production builds carry only the
+	/// derived `cipher` state.
+	#[cfg(any(test, feature = "kat-internals", feature = "differential"))]
+	raw_key: Zeroizing<Vec<u8>>,
 	_kfa: PhantomData<(K, F, A)>,
 }
 
@@ -39,14 +46,24 @@ impl<A: Aead> AssertNonceRange<A> {
 }
 
 impl<K: Kem, F: Kdf, A: Aead> Context<K, F, A> {
-	pub(crate) fn new(key: Vec<u8>, base_nonce: Vec<u8>, exporter_secret: Vec<u8>) -> Self {
-		Self {
-			key: Zeroizing::new(key),
+	pub(crate) fn new(
+		key: Vec<u8>,
+		base_nonce: Vec<u8>,
+		exporter_secret: Vec<u8>,
+	) -> Result<Self, HpkeError> {
+		// Wrap the raw key bytes in `Zeroizing` so the temporary heap
+		// allocation is scrubbed once the cipher has copied the material.
+		let key_z = Zeroizing::new(key);
+		let cipher = A::init(&key_z)?;
+		Ok(Self {
+			cipher,
 			base_nonce: Zeroizing::new(base_nonce),
 			exporter_secret: Zeroizing::new(exporter_secret),
 			seq: 0,
+			#[cfg(any(test, feature = "kat-internals", feature = "differential"))]
+			raw_key: Zeroizing::new(key_z.to_vec()),
 			_kfa: PhantomData,
-		}
+		})
 	}
 
 	/// `Context.Export` (RFC 9180 §5.3).
@@ -67,10 +84,12 @@ impl<K: Kem, F: Kdf, A: Aead> Context<K, F, A> {
 		let () = AssertNonceRange::<A>::CHECK;
 		let mut nonce = [0u8; 12];
 		let len = A::NONCE_LEN;
+		nonce[..len].copy_from_slice(&self.base_nonce[..len]);
 		let seq_be = self.seq.to_be_bytes();
-		nonce[len - 8..len].copy_from_slice(&seq_be);
-		for (i, n) in nonce.iter_mut().enumerate().take(len) {
-			*n ^= self.base_nonce[i];
+		// XOR the 8-byte big-endian sequence counter into the trailing
+		// 8 bytes of the (≤ 12-byte) nonce.
+		for i in 0..8 {
+			nonce[len - 8 + i] ^= seq_be[i];
 		}
 		nonce
 	}
@@ -81,7 +100,7 @@ impl<K: Kem, F: Kdf, A: Aead> Context<K, F, A> {
 	/// Test-only: expose the AEAD key.
 	#[must_use]
 	pub fn key(&self) -> &[u8] {
-		&self.key
+		&self.raw_key
 	}
 	/// Test-only: expose the base nonce.
 	#[must_use]
@@ -120,7 +139,7 @@ impl<K: Kem, F: Kdf, A: SealingAead> Context<K, F, A> {
 			return Err(HpkeError::MessageLimitReached);
 		}
 		let nonce = self.compute_nonce();
-		let ct = A::seal(&self.key, &nonce[..A::NONCE_LEN], aad, pt)?;
+		let ct = A::seal(&self.cipher, &nonce[..A::NONCE_LEN], aad, pt)?;
 		self.seq += 1; // checked above; cannot overflow
 		Ok(ct)
 	}
@@ -135,7 +154,7 @@ impl<K: Kem, F: Kdf, A: SealingAead> Context<K, F, A> {
 			return Err(HpkeError::MessageLimitReached);
 		}
 		let nonce = self.compute_nonce();
-		let pt = A::open(&self.key, &nonce[..A::NONCE_LEN], aad, ct)?;
+		let pt = A::open(&self.cipher, &nonce[..A::NONCE_LEN], aad, ct)?;
 		self.seq += 1;
 		Ok(pt)
 	}
@@ -154,8 +173,8 @@ mod tests {
 		let base_nonce = vec![0x77u8; 12];
 		let exporter_secret = vec![0u8; 32];
 		let mut sender: Ctx =
-			Context::new(key.clone(), base_nonce.clone(), exporter_secret.clone());
-		let mut receiver: Ctx = Context::new(key, base_nonce, exporter_secret);
+			Context::new(key.clone(), base_nonce.clone(), exporter_secret.clone()).unwrap();
+		let mut receiver: Ctx = Context::new(key, base_nonce, exporter_secret).unwrap();
 
 		let ct = sender.seal(b"aad", b"message").unwrap();
 		let pt = receiver.open(b"aad", &ct).unwrap();
@@ -174,7 +193,7 @@ mod tests {
 
 	#[test]
 	fn export_is_deterministic() {
-		let ctx: Ctx = Context::new(vec![0u8; 32], vec![0u8; 12], vec![1u8; 32]);
+		let ctx: Ctx = Context::new(vec![0u8; 32], vec![0u8; 12], vec![1u8; 32]).unwrap();
 		let a = ctx.export(b"context", 32).unwrap();
 		let b = ctx.export(b"context", 32).unwrap();
 		assert_eq!(a, b);
@@ -185,7 +204,7 @@ mod tests {
 
 	#[test]
 	fn export_length_bound() {
-		let ctx: Ctx = Context::new(vec![0u8; 32], vec![0u8; 12], vec![1u8; 32]);
+		let ctx: Ctx = Context::new(vec![0u8; 32], vec![0u8; 12], vec![1u8; 32]).unwrap();
 		assert_eq!(
 			ctx.export(b"ctx", 8161),
 			Err(HpkeError::ExportLengthExceeded)
@@ -194,7 +213,8 @@ mod tests {
 
 	#[test]
 	fn seal_rejects_at_message_limit() {
-		let mut ctx: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]);
+		let mut ctx: Ctx =
+			Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
 		ctx.set_seq_for_test(u64::MAX);
 		let r = ctx.seal(b"aad", b"hello");
 		assert_eq!(r, Err(HpkeError::MessageLimitReached));
@@ -202,8 +222,10 @@ mod tests {
 
 	#[test]
 	fn open_rejects_at_message_limit() {
-		let mut ctx: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]);
-		let mut sibling: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]);
+		let mut ctx: Ctx =
+			Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
+		let mut sibling: Ctx =
+			Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
 		let ct = sibling.seal(b"aad", b"hello").unwrap();
 		ctx.set_seq_for_test(u64::MAX);
 		let r = ctx.open(b"aad", &ct);

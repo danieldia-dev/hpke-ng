@@ -72,7 +72,7 @@ use core::marker::PhantomData;
 
 use zeroize::Zeroizing;
 
-use crate::kdf::{labeled_expand, labeled_extract};
+use crate::kdf::{labeled_expand_pieces, labeled_extract};
 
 /// HPKE configuration parameterized over a KEM, KDF, and AEAD.
 ///
@@ -169,17 +169,19 @@ fn key_schedule_inner<K: Kem, F: Kdf, A: Aead>(
 	let psk_id_hash = labeled_extract::<F>(&[], &suite, b"psk_id_hash", psk_id);
 	let info_hash = labeled_extract::<F>(&[], &suite, b"info_hash", info);
 
-	let mut ks_ctx = Vec::with_capacity(1 + psk_id_hash.len() + info_hash.len());
-	ks_ctx.push(mode);
-	ks_ctx.extend_from_slice(&psk_id_hash);
-	ks_ctx.extend_from_slice(&info_hash);
+	let mode_arr = [mode];
+	// `ks_context = mode || psk_id_hash || info_hash`. Fed piecewise into
+	// each `expand_multi_info` call instead of allocating a flat `Vec`.
+	let ks_pieces: [&[u8]; 3] = [&mode_arr, &psk_id_hash, &info_hash];
 
 	let secret = Zeroizing::new(labeled_extract::<F>(shared_secret, &suite, b"secret", psk));
-	let key = labeled_expand::<F>(&secret, &suite, b"key", &ks_ctx, A::KEY_LEN)?;
-	let base_nonce = labeled_expand::<F>(&secret, &suite, b"base_nonce", &ks_ctx, A::NONCE_LEN)?;
-	let exporter_secret = labeled_expand::<F>(&secret, &suite, b"exp", &ks_ctx, F::HASH_LEN)?;
+	let key = labeled_expand_pieces::<F>(&secret, &suite, b"key", &ks_pieces, A::KEY_LEN)?;
+	let base_nonce =
+		labeled_expand_pieces::<F>(&secret, &suite, b"base_nonce", &ks_pieces, A::NONCE_LEN)?;
+	let exporter_secret =
+		labeled_expand_pieces::<F>(&secret, &suite, b"exp", &ks_pieces, F::HASH_LEN)?;
 
-	Ok(Context::new(key, base_nonce, exporter_secret))
+	Context::new(key, base_nonce, exporter_secret)
 }
 
 #[cfg(test)]
@@ -187,35 +189,20 @@ mod ks_tests {
 	use super::*;
 
 	#[test]
-	fn psk_validation_inconsistent() {
-		let r = verify_psk_inputs(modes::PSK, b"", b"some_id");
-		assert_eq!(r, Err(HpkeError::InconsistentPsk));
-		let r = verify_psk_inputs(modes::PSK, &[0u8; 32], b"");
-		assert_eq!(r, Err(HpkeError::InconsistentPsk));
-	}
-
-	#[test]
-	fn psk_validation_missing() {
-		let r = verify_psk_inputs(modes::PSK, b"", b"");
-		assert_eq!(r, Err(HpkeError::MissingPsk));
-	}
-
-	#[test]
-	fn psk_validation_unnecessary() {
-		let r = verify_psk_inputs(modes::BASE, &[0u8; 32], b"id");
-		assert_eq!(r, Err(HpkeError::UnnecessaryPsk));
-	}
-
-	#[test]
-	fn psk_validation_too_short() {
-		let r = verify_psk_inputs(modes::PSK, b"too short", b"id");
-		assert_eq!(r, Err(HpkeError::InsecurePsk));
-	}
-
-	#[test]
-	fn psk_validation_ok() {
-		assert!(verify_psk_inputs(modes::BASE, b"", b"").is_ok());
-		assert!(verify_psk_inputs(modes::PSK, &[0u8; 32], b"id").is_ok());
+	fn psk_validation_matrix() {
+		use HpkeError::*;
+		let cases: &[(u8, &[u8], &[u8], Result<(), HpkeError>)] = &[
+			(modes::PSK, b"", b"some_id", Err(InconsistentPsk)),
+			(modes::PSK, &[0u8; 32], b"", Err(InconsistentPsk)),
+			(modes::PSK, b"", b"", Err(MissingPsk)),
+			(modes::BASE, &[0u8; 32], b"id", Err(UnnecessaryPsk)),
+			(modes::PSK, b"too short", b"id", Err(InsecurePsk)),
+			(modes::BASE, b"", b"", Ok(())),
+			(modes::PSK, &[0u8; 32], b"id", Ok(())),
+		];
+		for (mode, psk, psk_id, expected) in cases {
+			assert_eq!(verify_psk_inputs(*mode, psk, psk_id), *expected);
+		}
 	}
 }
 
@@ -584,130 +571,9 @@ mod hpke_tests {
 	use super::*;
 	use rand_core::{OsRng, TryRngCore as _};
 
-	type Suite = Hpke<DhKemX25519HkdfSha256, HkdfSha256, ChaCha20Poly1305>;
-
-	#[test]
-	fn setup_base_roundtrip_x25519_chacha() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (enc, mut sender) = Suite::setup_sender_base(&mut rng, &pk_r, b"info").unwrap();
-		let mut receiver = Suite::setup_receiver_base(&enc, &sk_r, b"info").unwrap();
-
-		let ct = sender.seal(b"aad", b"plaintext").unwrap();
-		let pt = receiver.open(b"aad", &ct).unwrap();
-		assert_eq!(pt, b"plaintext");
-	}
-
-	#[test]
-	fn setup_psk_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let psk = [0xAAu8; 32];
-		let psk_id = b"id";
-		let (enc, mut s) = Suite::setup_sender_psk(&mut rng, &pk_r, b"info", &psk, psk_id).unwrap();
-		let mut r = Suite::setup_receiver_psk(&enc, &sk_r, b"info", &psk, psk_id).unwrap();
-		let ct = s.seal(b"aad", b"hi").unwrap();
-		assert_eq!(r.open(b"aad", &ct).unwrap(), b"hi");
-	}
-
-	#[test]
-	fn setup_auth_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (enc, mut s) = Suite::setup_sender_auth(&mut rng, &pk_r, b"info", &sk_s).unwrap();
-		let mut r = Suite::setup_receiver_auth(&enc, &sk_r, b"info", &pk_s).unwrap();
-		let ct = s.seal(b"aad", b"auth").unwrap();
-		assert_eq!(r.open(b"aad", &ct).unwrap(), b"auth");
-	}
-
-	#[test]
-	fn setup_auth_psk_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let psk = [0xBBu8; 32];
-		let (enc, mut s) =
-			Suite::setup_sender_auth_psk(&mut rng, &pk_r, b"info", &psk, b"id", &sk_s).unwrap();
-		let mut r =
-			Suite::setup_receiver_auth_psk(&enc, &sk_r, b"info", &psk, b"id", &pk_s).unwrap();
-		let ct = s.seal(b"aad", b"auth-psk").unwrap();
-		assert_eq!(r.open(b"aad", &ct).unwrap(), b"auth-psk");
-	}
-
-	#[test]
-	fn single_shot_base_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (enc, ct) = Suite::seal_base(&mut rng, &pk_r, b"info", b"aad", b"hi").unwrap();
-		assert_eq!(
-			Suite::open_base(&enc, &sk_r, b"info", b"aad", &ct).unwrap(),
-			b"hi"
-		);
-	}
-
-	#[test]
-	fn single_shot_psk_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let psk = [0u8; 32];
-		let (enc, ct) = Suite::seal_psk(&mut rng, &pk_r, b"i", b"a", b"p", &psk, b"id").unwrap();
-		assert_eq!(
-			Suite::open_psk(&enc, &sk_r, b"i", b"a", &ct, &psk, b"id").unwrap(),
-			b"p",
-		);
-	}
-
-	#[test]
-	fn single_shot_auth_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (enc, ct) = Suite::seal_auth(&mut rng, &pk_r, b"i", b"a", b"p", &sk_s).unwrap();
-		assert_eq!(
-			Suite::open_auth(&enc, &sk_r, b"i", b"a", &ct, &pk_s).unwrap(),
-			b"p",
-		);
-	}
-
-	#[test]
-	fn single_shot_auth_psk_roundtrip() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let psk = [0u8; 32];
-		let (enc, ct) =
-			Suite::seal_auth_psk(&mut rng, &pk_r, b"i", b"a", b"p", &psk, b"id", &sk_s).unwrap();
-		assert_eq!(
-			Suite::open_auth_psk(&enc, &sk_r, b"i", b"a", &ct, &psk, b"id", &pk_s).unwrap(),
-			b"p",
-		);
-	}
-
-	#[test]
-	fn export_sender_receiver_match_base() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (enc, sender_secret) =
-			Suite::send_export_base(&mut rng, &pk_r, b"info", b"ctx", 32).unwrap();
-		let receiver_secret =
-			Suite::receiver_export_base(&enc, &sk_r, b"info", b"ctx", 32).unwrap();
-		assert_eq!(sender_secret, receiver_secret);
-		assert_eq!(sender_secret.len(), 32);
-	}
-
-	/// `ExportOnly` suites have export methods but `seal_*` / `open_*` are
-	/// uninstantiable because `A: SealingAead` is not satisfied — verified by
-	/// the fact that this function compiles.
+	/// Type-level check: `ExportOnly` suites compile without a `SealingAead`
+	/// bound, exposing only `*_export_*` methods. The full setup/seal/open
+	/// matrix lives in `tests/roundtrip.rs`.
 	#[test]
 	fn export_only_suite_compiles() {
 		type ExportSuite = Hpke<DhKemX25519HkdfSha256, HkdfSha256, ExportOnly>;
@@ -718,49 +584,5 @@ mod hpke_tests {
 			ExportSuite::send_export_base(&mut rng, &pk_r, b"info", b"ctx", 32).unwrap();
 		let recv = ExportSuite::receiver_export_base(&enc, &sk_r, b"info", b"ctx", 32).unwrap();
 		assert_eq!(sec, recv);
-	}
-
-	#[test]
-	fn export_sender_receiver_match_psk() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let psk = [0x33u8; 32];
-		let (enc, sec) =
-			Suite::send_export_psk(&mut rng, &pk_r, b"info", &psk, b"id", b"ctx", 64).unwrap();
-		let recv =
-			Suite::receiver_export_psk(&enc, &sk_r, b"info", &psk, b"id", b"ctx", 64).unwrap();
-		assert_eq!(sec, recv);
-		assert_eq!(sec.len(), 64);
-	}
-
-	#[test]
-	fn export_sender_receiver_match_auth() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (enc, sec) =
-			Suite::send_export_auth(&mut rng, &pk_r, b"info", &sk_s, b"ctx", 48).unwrap();
-		let recv = Suite::receiver_export_auth(&enc, &sk_r, b"info", &pk_s, b"ctx", 48).unwrap();
-		assert_eq!(sec, recv);
-		assert_eq!(sec.len(), 48);
-	}
-
-	#[test]
-	fn export_sender_receiver_match_auth_psk() {
-		let mut os_rng = OsRng;
-		let mut rng = os_rng.unwrap_mut();
-		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let (sk_s, pk_s) = DhKemX25519HkdfSha256::generate(&mut rng).unwrap();
-		let psk = [0x77u8; 32];
-		let (enc, sec) =
-			Suite::send_export_auth_psk(&mut rng, &pk_r, b"info", &psk, b"id", &sk_s, b"ctx", 32)
-				.unwrap();
-		let recv =
-			Suite::receiver_export_auth_psk(&enc, &sk_r, b"info", &psk, b"id", &pk_s, b"ctx", 32)
-				.unwrap();
-		assert_eq!(sec, recv);
-		assert_eq!(sec.len(), 32);
 	}
 }
