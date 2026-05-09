@@ -213,8 +213,7 @@ mod tests {
 
 	#[test]
 	fn seal_rejects_at_message_limit() {
-		let mut ctx: Ctx =
-			Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
+		let mut ctx: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
 		ctx.set_seq_for_test(u64::MAX);
 		let r = ctx.seal(b"aad", b"hello");
 		assert_eq!(r, Err(HpkeError::MessageLimitReached));
@@ -222,8 +221,7 @@ mod tests {
 
 	#[test]
 	fn open_rejects_at_message_limit() {
-		let mut ctx: Ctx =
-			Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
+		let mut ctx: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
 		let mut sibling: Ctx =
 			Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
 		let ct = sibling.seal(b"aad", b"hello").unwrap();

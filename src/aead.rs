@@ -142,7 +142,10 @@ impl SealingAead for Aes128Gcm {
 	) -> Result<Vec<u8>, HpkeError> {
 		use aes_gcm::aead::Aead as _;
 		cipher
-			.encrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: pt, aad })
+			.encrypt(
+				aes_gcm::Nonce::from_slice(nonce),
+				aead::Payload { msg: pt, aad },
+			)
 			.map_err(|_| HpkeError::SealError)
 	}
 	fn open(
@@ -153,7 +156,10 @@ impl SealingAead for Aes128Gcm {
 	) -> Result<Vec<u8>, HpkeError> {
 		use aes_gcm::aead::Aead as _;
 		cipher
-			.decrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: ct, aad })
+			.decrypt(
+				aes_gcm::Nonce::from_slice(nonce),
+				aead::Payload { msg: ct, aad },
+			)
 			.map_err(|_| HpkeError::OpenError)
 	}
 }
@@ -187,7 +193,10 @@ impl SealingAead for Aes256Gcm {
 	) -> Result<Vec<u8>, HpkeError> {
 		use aes_gcm::aead::Aead as _;
 		cipher
-			.encrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: pt, aad })
+			.encrypt(
+				aes_gcm::Nonce::from_slice(nonce),
+				aead::Payload { msg: pt, aad },
+			)
 			.map_err(|_| HpkeError::SealError)
 	}
 	fn open(
@@ -198,7 +207,10 @@ impl SealingAead for Aes256Gcm {
 	) -> Result<Vec<u8>, HpkeError> {
 		use aes_gcm::aead::Aead as _;
 		cipher
-			.decrypt(aes_gcm::Nonce::from_slice(nonce), aead::Payload { msg: ct, aad })
+			.decrypt(
+				aes_gcm::Nonce::from_slice(nonce),
+				aead::Payload { msg: ct, aad },
+			)
 			.map_err(|_| HpkeError::OpenError)
 	}
 }

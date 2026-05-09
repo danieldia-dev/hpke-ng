@@ -23,8 +23,7 @@ pub trait Kdf: Sealed {
 	/// HKDF-Expand over a sequence of info pieces.
 	///
 	/// Pieces are fed via `Hkdf::expand_multi_info` without concatenation.
-	fn expand(prk: &[u8], info_pieces: &[&[u8]], out_len: usize)
-	-> Result<Vec<u8>, HpkeError>;
+	fn expand(prk: &[u8], info_pieces: &[&[u8]], out_len: usize) -> Result<Vec<u8>, HpkeError>;
 }
 
 macro_rules! hkdf_impl {
@@ -295,14 +294,9 @@ mod tests {
 
 		let prk = [0u8; 32];
 		let s_exp = labeled_expand::<HkdfSha256>(&prk, suite_id, b"k", b"context", 32).unwrap();
-		let p_exp = labeled_expand_pieces::<HkdfSha256>(
-			&prk,
-			suite_id,
-			b"k",
-			&[b"con", b"text"],
-			32,
-		)
-		.unwrap();
+		let p_exp =
+			labeled_expand_pieces::<HkdfSha256>(&prk, suite_id, b"k", &[b"con", b"text"], 32)
+				.unwrap();
 		assert_eq!(s_exp, p_exp);
 	}
 

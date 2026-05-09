@@ -970,7 +970,10 @@ mod tests {
 		clamped[55] |= 0x80;
 		let sk_u = X448::sk_from_bytes(&unclamped).unwrap();
 		let sk_c = X448::sk_from_bytes(&clamped).unwrap();
-		assert_eq!(X448::sk_to_pk(&sk_u).as_ref(), X448::sk_to_pk(&sk_c).as_ref());
+		assert_eq!(
+			X448::sk_to_pk(&sk_u).as_ref(),
+			X448::sk_to_pk(&sk_c).as_ref()
+		);
 		let mut os_rng = OsRng;
 		let (_, pk_peer) = X448::generate(&mut os_rng.unwrap_mut());
 		assert_eq!(
@@ -1001,7 +1004,10 @@ mod tests {
 		let mut tampered = [0u8; 32];
 		tampered.copy_from_slice(pk_c.as_ref());
 		tampered[31] |= 0x80;
-		assert_eq!(X25519::pk_from_bytes(&tampered).unwrap().as_ref(), pk_c.as_ref());
+		assert_eq!(
+			X25519::pk_from_bytes(&tampered).unwrap().as_ref(),
+			pk_c.as_ref()
+		);
 	}
 
 	/// RFC 9180 §7.1.1: NIST/secp256k1 `DeserializePublicKey` is the
@@ -1035,7 +1041,10 @@ mod tests {
 	fn p256_pk_from_bytes_rejects_wrong_length_and_tag() {
 		use p256::elliptic_curve::sec1::ToEncodedPoint;
 		for bad in [&[][..], &[0u8], &[0u8; 64], &[0u8; 66]] {
-			assert!(matches!(P256::pk_from_bytes(bad), Err(HpkeError::InvalidPublicKey)));
+			assert!(matches!(
+				P256::pk_from_bytes(bad),
+				Err(HpkeError::InvalidPublicKey)
+			));
 		}
 		let mut os_rng = OsRng;
 		let (_, pk) = P256::generate(&mut os_rng.unwrap_mut());
@@ -1043,7 +1052,10 @@ mod tests {
 		// Hybrid (0x06/0x07) has the right length but is not `Tag::Uncompressed`.
 		for tag in [0x06, 0x07] {
 			tampered[0] = tag;
-			assert!(matches!(P256::pk_from_bytes(&tampered), Err(HpkeError::InvalidPublicKey)));
+			assert!(matches!(
+				P256::pk_from_bytes(&tampered),
+				Err(HpkeError::InvalidPublicKey)
+			));
 		}
 	}
 
