@@ -1102,19 +1102,19 @@ mod tests {
 		let mut rng = os_rng.unwrap_mut();
 
 		// `generate` produces clamped storage.
-		let (sk_g, _) = Suite::generate(&mut rng).unwrap();
-		let bytes_g = Suite::sk_to_bytes(&sk_g);
-		assert_clamped(&bytes_g);
+		let (sk_gen, _) = Suite::generate(&mut rng).unwrap();
+		let bytes_gen = Suite::sk_to_bytes(&sk_gen);
+		assert_clamped(&bytes_gen);
 
 		// `derive` produces clamped storage.
-		let (sk_d, _) = Suite::derive_key_pair(b"hpke-ng x25519 canonical test").unwrap();
-		let bytes_d = Suite::sk_to_bytes(&sk_d);
-		assert_clamped(&bytes_d);
+		let (sk_drv, _) = Suite::derive_key_pair(b"hpke-ng x25519 canonical test").unwrap();
+		let bytes_drv = Suite::sk_to_bytes(&sk_drv);
+		assert_clamped(&bytes_drv);
 
 		// Roundtrip is byte-stable on both paths.
-		let bytes_g2 = Suite::sk_to_bytes(&Suite::sk_from_bytes(&bytes_g).unwrap());
-		assert_eq!(bytes_g.as_slice(), bytes_g2.as_slice());
-		let bytes_d2 = Suite::sk_to_bytes(&Suite::sk_from_bytes(&bytes_d).unwrap());
-		assert_eq!(bytes_d.as_slice(), bytes_d2.as_slice());
+		let roundtrip_gen = Suite::sk_to_bytes(&Suite::sk_from_bytes(&bytes_gen).unwrap());
+		assert_eq!(bytes_gen.as_slice(), roundtrip_gen.as_slice());
+		let roundtrip_drv = Suite::sk_to_bytes(&Suite::sk_from_bytes(&bytes_drv).unwrap());
+		assert_eq!(bytes_drv.as_slice(), roundtrip_drv.as_slice());
 	}
 }
