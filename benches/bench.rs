@@ -8,7 +8,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use hpke_ng::{kem::AuthKem, *};
+use hpke_ng::*;
 use rand_core::{OsRng, TryRngCore as _};
 
 type X25519Suite = Hpke<DhKemX25519HkdfSha256, HkdfSha256, ChaCha20Poly1305>;
