@@ -7,7 +7,9 @@ use rand_core::{CryptoRng, RngCore};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::HpkeError;
-use crate::kdf::{Kdf, labeled_expand, labeled_expand_pieces, labeled_extract};
+use crate::kdf::{
+	Kdf, labeled_expand, labeled_expand_pieces, labeled_extract, labeled_extract_pieces,
+};
 use crate::kem::{AuthKem, Kem};
 use crate::sealed::Sealed;
 
@@ -189,6 +191,26 @@ fn extract_and_expand<D: DiffieHellman, H: Kdf>(
 	let suite = suite_id::<D>();
 	// `eae_prk` is the PRK derived from the raw DH output; treat it as secret.
 	let eae_prk = Zeroizing::new(labeled_extract::<H>(&[], &suite, b"eae_prk", dh));
+	labeled_expand_pieces::<H>(
+		&eae_prk,
+		&suite,
+		b"shared_secret",
+		kem_context,
+		D::SHARED_SECRET_LEN,
+	)
+}
+
+fn extract_and_expand_pieces<D: DiffieHellman, H: Kdf>(
+	dh_pieces: &[&[u8]],
+	kem_context: &[&[u8]],
+) -> Result<Vec<u8>, HpkeError> {
+	let suite = suite_id::<D>();
+	let eae_prk = Zeroizing::new(labeled_extract_pieces::<H>(
+		&[],
+		&suite,
+		b"eae_prk",
+		dh_pieces,
+	));
 	labeled_expand_pieces::<H>(
 		&eae_prk,
 		&suite,
@@ -455,14 +477,9 @@ impl<D: DiffieHellman, H: Kdf> AuthKem for DhKem<D, H> {
 		let pk_e = D::pk_from_bytes(&enc.0)?;
 		let dh1 = Zeroizing::new(D::dh(&sk_r.sk, &pk_e)?);
 		let dh2 = Zeroizing::new(D::dh(&sk_r.sk, &pk_s.0)?);
-		let mut dh = Zeroizing::new(Vec::with_capacity(dh1.len() + dh2.len()));
-		dh.extend_from_slice(&dh1);
-		dh.extend_from_slice(&dh2);
-
-		// Cached `sk_r.pk_bytes` replaces a per-call base-point scalar mult.
 		let pk_sender = D::pk_to_bytes(&pk_s.0);
-		Ok(DhSharedSecret(extract_and_expand::<D, H>(
-			&dh,
+		Ok(DhSharedSecret(extract_and_expand_pieces::<D, H>(
+			&[&dh1, &dh2],
 			&[&enc.0, &sk_r.pk_bytes, &pk_sender],
 		)?))
 	}
@@ -482,11 +499,11 @@ fn encap_with<D: DiffieHellman, H: Kdf, R: CryptoRng + RngCore>(
 		None => extract_and_expand::<D, H>(&dh1, &[&enc, &pk_recipient])?,
 		Some(sk_s) => {
 			let dh2 = Zeroizing::new(D::dh(&sk_s.sk, &pk_r.0)?);
-			let mut dh = Zeroizing::new(Vec::with_capacity(dh1.len() + dh2.len()));
-			dh.extend_from_slice(&dh1);
-			dh.extend_from_slice(&dh2);
 			// Cached sender public-key bytes — no `sk_to_pk` round trip.
-			extract_and_expand::<D, H>(&dh, &[&enc, &pk_recipient, &sk_s.pk_bytes])?
+			extract_and_expand_pieces::<D, H>(
+				&[&dh1, &dh2],
+				&[&enc, &pk_recipient, &sk_s.pk_bytes],
+			)?
 		}
 	};
 
@@ -521,14 +538,11 @@ pub(crate) fn auth_encap_with_ikm<D: DiffieHellman, H: Kdf>(
 	let (sk_e, pk_e) = D::derive(ikm_e)?;
 	let dh1 = Zeroizing::new(D::dh(&sk_e, &pk_r.0)?);
 	let dh2 = Zeroizing::new(D::dh(&sk_s.sk, &pk_r.0)?);
-	let mut dh = Zeroizing::new(Vec::with_capacity(dh1.len() + dh2.len()));
-	dh.extend_from_slice(&dh1);
-	dh.extend_from_slice(&dh2);
 	let enc = D::pk_to_bytes(&pk_e);
 	let pk_recipient = D::pk_to_bytes(&pk_r.0);
 	Ok((
-		DhSharedSecret(extract_and_expand::<D, H>(
-			&dh,
+		DhSharedSecret(extract_and_expand_pieces::<D, H>(
+			&[&dh1, &dh2],
 			&[&enc, &pk_recipient, &sk_s.pk_bytes],
 		)?),
 		DhEncappedKey(enc),
