@@ -8,7 +8,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use hpke_ng::*;
+use hpke_ng::{kem::AuthKem, *};
 use rand_core::{OsRng, TryRngCore as _};
 
 type X25519Suite = Hpke<DhKemX25519HkdfSha256, HkdfSha256, ChaCha20Poly1305>;
@@ -38,12 +38,31 @@ fn bench_kem(c: &mut Criterion) {
 			})
 		});
 
-		let mut os = OsRng;
 		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
-		let mut os = OsRng;
 		let (_, enc) = DhKemX25519HkdfSha256::encap(&mut os.unwrap_mut(), &pk_r).unwrap();
 		g.bench_function("x25519/decap", |b| {
 			b.iter(|| DhKemX25519HkdfSha256::decap(black_box(&enc), &sk_r).unwrap())
+		});
+	}
+
+	{
+		let mut os = OsRng;
+		let (sk_s, _) = DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
+		let (_, pk_r) = DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
+		g.bench_function("x25519/auth_encap", |b| {
+			b.iter(|| {
+				let mut os = OsRng;
+				DhKemX25519HkdfSha256::auth_encap(&mut os.unwrap_mut(), black_box(&pk_r), &sk_s)
+					.unwrap()
+			})
+		});
+
+		let (sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
+		let (sk_s, pk_s) = DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
+		let (_, enc) =
+			DhKemX25519HkdfSha256::auth_encap(&mut os.unwrap_mut(), &pk_r, &sk_s).unwrap();
+		g.bench_function("x25519/auth_decap", |b| {
+			b.iter(|| DhKemX25519HkdfSha256::auth_decap(black_box(&enc), &sk_r, &pk_s).unwrap())
 		});
 	}
 
@@ -81,7 +100,6 @@ fn bench_setup(c: &mut Criterion) {
 	});
 
 	{
-		let mut os = OsRng;
 		let (enc, _ctx) =
 			X25519Suite::setup_sender_base(&mut os.unwrap_mut(), &pk_r, b"info").unwrap();
 		g.bench_function("x25519_chacha/setup_receiver_base", |b| {
@@ -119,7 +137,6 @@ fn bench_seal_open(c: &mut Criterion) {
 			},
 		);
 
-		let mut os = OsRng;
 		let (enc, ct) =
 			X25519Suite::seal_base(&mut os.unwrap_mut(), &pk_r, b"info", b"aad", &pt).unwrap();
 		g.bench_with_input(
@@ -135,7 +152,6 @@ fn bench_seal_open(c: &mut Criterion) {
 	}
 
 	{
-		let mut os = OsRng;
 		let (_, mut sender) =
 			X25519Suite::setup_sender_base(&mut os.unwrap_mut(), &pk_r, b"info").unwrap();
 		for &size in &[64usize, 1024, 16384] {
@@ -156,7 +172,6 @@ fn bench_export(c: &mut Criterion) {
 	let mut g = c.benchmark_group("export");
 	let mut os = OsRng;
 	let (_sk_r, pk_r) = DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
-	let mut os = OsRng;
 	let (_enc, ctx) = X25519Suite::setup_sender_base(&mut os.unwrap_mut(), &pk_r, b"info").unwrap();
 
 	for &len in &[32usize, 64, 128] {
