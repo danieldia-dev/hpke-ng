@@ -184,6 +184,7 @@ fn suite_id<D: DiffieHellman>() -> [u8; 5] {
 	s
 }
 
+#[inline]
 fn extract_and_expand<D: DiffieHellman, H: Kdf>(
 	dh: &[u8],
 	kem_context: &[&[u8]],
@@ -200,6 +201,7 @@ fn extract_and_expand<D: DiffieHellman, H: Kdf>(
 	)
 }
 
+#[inline]
 fn extract_and_expand_pieces<D: DiffieHellman, H: Kdf>(
 	dh_pieces: &[&[u8]],
 	kem_context: &[&[u8]],
@@ -488,14 +490,14 @@ impl<D: DiffieHellman, H: Kdf> AuthKem for DhKem<D, H> {
 fn encap_with<D: DiffieHellman, H: Kdf, R: CryptoRng + RngCore>(
 	rng: &mut R,
 	pk_r: &DhPublicKey<D>,
-	sk_s_authed: Option<&DhPrivateKey<D>>,
+	sk_sender: Option<&DhPrivateKey<D>>,
 ) -> Result<(DhSharedSecret, DhEncappedKey), HpkeError> {
 	let (sk_e, pk_e) = D::generate(rng);
 	let dh1 = Zeroizing::new(D::dh(&sk_e, &pk_r.0)?);
 	let enc = D::pk_to_bytes(&pk_e);
 	let pk_recipient = D::pk_to_bytes(&pk_r.0);
 
-	let ss = match sk_s_authed {
+	let ss = match sk_sender {
 		None => extract_and_expand::<D, H>(&dh1, &[&enc, &pk_recipient])?,
 		Some(sk_s) => {
 			let dh2 = Zeroizing::new(D::dh(&sk_s.sk, &pk_r.0)?);
