@@ -227,6 +227,6 @@ mod tests {
 		let ct = sibling.seal(b"aad", b"hello").unwrap();
 		ctx.set_seq_for_test(u64::MAX);
 		let r = ctx.open(b"aad", &ct);
-		assert!(r.is_err());
+		assert_eq!(r, Err(HpkeError::MessageLimitReached));
 	}
 }
