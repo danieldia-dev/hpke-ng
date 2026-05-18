@@ -184,6 +184,7 @@ fn suite_id<D: DiffieHellman>() -> [u8; 5] {
 	s
 }
 
+#[inline]
 fn extract_and_expand<D: DiffieHellman, H: Kdf>(
 	dh: &[u8],
 	kem_context: &[&[u8]],
@@ -200,6 +201,7 @@ fn extract_and_expand<D: DiffieHellman, H: Kdf>(
 	)
 }
 
+#[inline]
 fn extract_and_expand_pieces<D: DiffieHellman, H: Kdf>(
 	dh_pieces: &[&[u8]],
 	kem_context: &[&[u8]],
@@ -429,14 +431,14 @@ impl<D: DiffieHellman, H: Kdf> Kem for DhKem<D, H> {
 		enc: &Self::EncappedKey,
 		sk_r: &Self::PrivateKey,
 	) -> Result<Self::SharedSecret, HpkeError> {
-		let pk_e = D::pk_from_bytes(&enc.0)?;
+		let pk_e = D::pk_from_bytes(enc.as_ref())?;
 		let dh = Zeroizing::new(D::dh(&sk_r.sk, &pk_e)?);
 		// `sk_r.pk_bytes` was cached at construction time; using it here
 		// saves the base-point scalar mult that `sk_to_pk` would otherwise
 		// perform on every decap.
 		Ok(DhSharedSecret(extract_and_expand::<D, H>(
 			&dh,
-			&[&enc.0, &sk_r.pk_bytes],
+			&[enc.as_ref(), &sk_r.pk_bytes],
 		)?))
 	}
 
@@ -474,13 +476,13 @@ impl<D: DiffieHellman, H: Kdf> AuthKem for DhKem<D, H> {
 		sk_r: &Self::PrivateKey,
 		pk_s: &Self::PublicKey,
 	) -> Result<Self::SharedSecret, HpkeError> {
-		let pk_e = D::pk_from_bytes(&enc.0)?;
+		let pk_e = D::pk_from_bytes(enc.as_ref())?;
 		let dh1 = Zeroizing::new(D::dh(&sk_r.sk, &pk_e)?);
 		let dh2 = Zeroizing::new(D::dh(&sk_r.sk, &pk_s.0)?);
 		let pk_sender = D::pk_to_bytes(&pk_s.0);
 		Ok(DhSharedSecret(extract_and_expand_pieces::<D, H>(
 			&[&dh1, &dh2],
-			&[&enc.0, &sk_r.pk_bytes, &pk_sender],
+			&[enc.as_ref(), &sk_r.pk_bytes, &pk_sender],
 		)?))
 	}
 }
@@ -488,14 +490,14 @@ impl<D: DiffieHellman, H: Kdf> AuthKem for DhKem<D, H> {
 fn encap_with<D: DiffieHellman, H: Kdf, R: CryptoRng + RngCore>(
 	rng: &mut R,
 	pk_r: &DhPublicKey<D>,
-	sk_s_authed: Option<&DhPrivateKey<D>>,
+	sk_sender: Option<&DhPrivateKey<D>>,
 ) -> Result<(DhSharedSecret, DhEncappedKey), HpkeError> {
 	let (sk_e, pk_e) = D::generate(rng);
 	let dh1 = Zeroizing::new(D::dh(&sk_e, &pk_r.0)?);
 	let enc = D::pk_to_bytes(&pk_e);
 	let pk_recipient = D::pk_to_bytes(&pk_r.0);
 
-	let ss = match sk_s_authed {
+	let ss = match sk_sender {
 		None => extract_and_expand::<D, H>(&dh1, &[&enc, &pk_recipient])?,
 		Some(sk_s) => {
 			let dh2 = Zeroizing::new(D::dh(&sk_s.sk, &pk_r.0)?);
@@ -994,6 +996,48 @@ mod tests {
 			X448::dh(&sk_u, &pk_peer).unwrap(),
 			X448::dh(&sk_c, &pk_peer).unwrap(),
 		);
+	}
+
+	/// Verify that `extract_and_expand_pieces` produces the same output
+	/// as `extract_and_expand` when given two DH slices that together
+	/// equal the single concatenated input.
+	#[test]
+	fn extract_and_expand_pieces_matches_concat() {
+		let dh1 = [0x01u8; 32];
+		let dh2 = [0x02u8; 32];
+		let mut dh_concat = Vec::new();
+		dh_concat.extend_from_slice(&dh1);
+		dh_concat.extend_from_slice(&dh2);
+
+		let kem_context: &[&[u8]] = &[b"enc_bytes", b"pk_recipient"];
+
+		let single =
+			extract_and_expand::<X25519, crate::HkdfSha256>(&dh_concat, kem_context).unwrap();
+
+		let pieces =
+			extract_and_expand_pieces::<X25519, crate::HkdfSha256>(&[&dh1, &dh2], kem_context)
+				.unwrap();
+
+		assert_eq!(single, pieces);
+	}
+
+	// Unit test that specifically calls `auth_encap_with_ikm` and `auth_decap`
+	// directly (bypassing the full HPKE stack), so that failures point exactly
+	// at the KEM layer (rather than somewhere in the key schedule or AEAD on top of it).
+	#[test]
+	fn x25519_auth_encap_decap_roundtrip() {
+		type Suite = DhKem<X25519, crate::HkdfSha256>;
+
+		let (sk_r, pk_r) = Suite::derive_key_pair(b"auth-test-recipient-ikm").unwrap();
+		let (sk_s, pk_s) = Suite::derive_key_pair(b"auth-test-sender-ikm").unwrap();
+
+		let ikm_e = b"auth-test-ephemeral-ikm";
+		let (ss_enc, enc) =
+			auth_encap_with_ikm::<X25519, crate::HkdfSha256>(&pk_r, &sk_s, ikm_e).unwrap();
+
+		let ss_dec = Suite::auth_decap(&enc, &sk_r, &pk_s).unwrap();
+
+		assert_eq!(ss_enc.as_ref(), ss_dec.as_ref());
 	}
 
 	/// All public `DhKem` aliases satisfy both `Kem` and `AuthKem`. Compile-only.
