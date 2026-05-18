@@ -220,6 +220,19 @@ mod tests {
 	}
 
 	#[test]
+	fn seal_succeeds_before_message_limit_then_fails() {
+		let mut ctx: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
+		// Last valid sequence number --> seal must succeed.
+		ctx.set_seq_for_test(u64::MAX - 1);
+		assert!(ctx.seal(b"aad", b"hello").is_ok());
+		// seq is now u64::MAX --> next seal must be rejected.
+		assert_eq!(
+			ctx.seal(b"aad", b"hello"),
+			Err(HpkeError::MessageLimitReached)
+		);
+	}
+
+	#[test]
 	fn open_rejects_at_message_limit() {
 		let mut ctx: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
 		let mut sibling: Ctx =

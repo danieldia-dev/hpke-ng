@@ -1021,6 +1021,25 @@ mod tests {
 		assert_eq!(single, pieces);
 	}
 
+	// Unit test that specifically calls `auth_encap_with_ikm` and `auth_decap`
+	// directly (bypassing the full HPKE stack), so that failures point exactly
+	// at the KEM layer (rather than somewhere in the key schedule or AEAD on top of it).
+	#[test]
+	fn x25519_auth_encap_decap_roundtrip() {
+		type Suite = DhKem<X25519, crate::HkdfSha256>;
+
+		let (sk_r, pk_r) = Suite::derive_key_pair(b"auth-test-recipient-ikm").unwrap();
+		let (sk_s, pk_s) = Suite::derive_key_pair(b"auth-test-sender-ikm").unwrap();
+
+		let ikm_e = b"auth-test-ephemeral-ikm";
+		let (ss_enc, enc) =
+			auth_encap_with_ikm::<X25519, crate::HkdfSha256>(&pk_r, &sk_s, ikm_e).unwrap();
+
+		let ss_dec = Suite::auth_decap(&enc, &sk_r, &pk_s).unwrap();
+
+		assert_eq!(ss_enc.as_ref(), ss_dec.as_ref());
+	}
+
 	/// All public `DhKem` aliases satisfy both `Kem` and `AuthKem`. Compile-only.
 	#[test]
 	fn aliases_implement_kem_and_authkem() {
