@@ -124,6 +124,13 @@ impl<K: Kem, F: Kdf, A: Aead> Context<K, F, A> {
 	pub(crate) fn set_seq_for_test(&mut self, seq: u64) {
 		self.seq = seq;
 	}
+	/// Test-only: compute the nonce for the current sequence number.
+	/// Used to directly verify that the XOR formula from RFC 9180 §5.2
+	/// is applied correctly across specific sequence number values.
+	#[cfg(test)]
+	pub(crate) fn compute_nonce_for_test(&self) -> [u8; 12] {
+		self.compute_nonce()
+	}
 }
 
 impl<K: Kem, F: Kdf, A: SealingAead> Context<K, F, A> {
@@ -209,6 +216,30 @@ mod tests {
 			ctx.export(b"ctx", 8161),
 			Err(HpkeError::ExportLengthExceeded)
 		);
+	}
+
+	#[test]
+	fn nonce_derivation_xors_seq_into_base_nonce() {
+		let mut ctx: Ctx = Context::new(vec![0u8; 32], vec![0u8; 12], vec![0u8; 32]).unwrap();
+
+		// seq == 0: nonce must equal base_nonce exactly
+		let n0 = ctx.compute_nonce_for_test();
+		assert_eq!(n0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+		// seq == 1: only the last byte changes
+		ctx.set_seq_for_test(1);
+		let n1 = ctx.compute_nonce_for_test();
+		assert_eq!(n1, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+		// seq == 256: carry into byte 10
+		ctx.set_seq_for_test(256);
+		let n256 = ctx.compute_nonce_for_test();
+		assert_eq!(n256, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+
+		// seq == 0x0102030405060708: all 8 trailing bytes affected
+		ctx.set_seq_for_test(0x0102030405060708);
+		let n_large = ctx.compute_nonce_for_test();
+		assert_eq!(n_large, [0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
 	}
 
 	#[test]
