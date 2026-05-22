@@ -236,8 +236,8 @@ mod tests {
 		let n256 = ctx.compute_nonce_for_test();
 		assert_eq!(n256, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
 
-		// seq == 0x0102030405060708: all 8 trailing bytes affected
-		ctx.set_seq_for_test(0x0102030405060708);
+		// seq == 0x0102_0304_0506_0708: all 8 trailing bytes affected
+		ctx.set_seq_for_test(0x0102_0304_0506_0708);
 		let n_large = ctx.compute_nonce_for_test();
 		assert_eq!(n_large, [0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
 	}
