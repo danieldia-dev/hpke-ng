@@ -159,8 +159,8 @@ impl Kem for XWingDraft06 {
 
 	fn derive_key_pair(ikm: &[u8]) -> Result<(Self::PrivateKey, Self::PublicKey), HpkeError> {
 		// X-Wing draft-06 specifies raw SHAKE-256(ikm, 32) for DeriveKeyPair.
-		use sha3::digest::{ExtendableOutput, Update, XofReader};
-		let mut hasher = sha3::Shake256::default();
+		use shake::digest::{ExtendableOutput, Update, XofReader};
+		let mut hasher = shake::Shake256::default();
 		hasher.update(ikm);
 		let mut reader = hasher.finalize_xof();
 		let mut seed = [0u8; 32];
