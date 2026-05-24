@@ -6,7 +6,7 @@ fn main() {
 	let mut os = OsRng;
 	let (_, pk_r) = DhKemX25519HkdfSha256::derive_key_pair(b"test-recipient").unwrap();
 
-	let (enc, ct) = Hpke::<DhKemX25519HkdfSha256, HkdfSha256, ExportOnly>::seal_base(
+	let (_enc, _ct) = Hpke::<DhKemX25519HkdfSha256, HkdfSha256, ExportOnly>::seal_base(
 		&mut os.unwrap_mut(),
 		&pk_r,
 		b"info",

@@ -7,7 +7,7 @@ fn main() {
 	let (sk_s, _) = MlKem768::generate(&mut os.unwrap_mut()).unwrap();
 	let (_, pk_r) = MlKem768::derive_key_pair(&[0u8; 64]).unwrap();
 
-	let (enc, ct) = Hpke::<MlKem768, HkdfSha256, ChaCha20Poly1305>::seal_auth(
+	let (_enc, _ct) = Hpke::<MlKem768, HkdfSha256, ChaCha20Poly1305>::seal_auth(
 		&mut os.unwrap_mut(),
 		&pk_r,
 		b"info",
