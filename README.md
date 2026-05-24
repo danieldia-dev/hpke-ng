@@ -69,14 +69,14 @@ Across 62 head-to-head benchmarks vs. `hpke-rs`: **43 wins** for `hpke-ng`, **14
 
 Memory and binary footprint:
 
-| Quantity                                       | hpke-rs   | hpke-ng        |
-|------------------------------------------------|-----------|----------------|
+| Quantity                                       | hpke-rs   | hpke-ng                     |
+|------------------------------------------------|-----------|-----------------------------|
 | `Hpke<K, F, A>` struct                         | 320 bytes | **0 bytes** (`PhantomData`) |
-| `Context<_, _, ChaCha20Poly1305>` struct       | 400 bytes | **88 bytes**   |
-| `Context<_, _, ExportOnly>` struct             | n/a       | **56 bytes**   |
-| `Context<_, _, Aes128Gcm>` struct              | 400 bytes | 792 bytes      |
-| `Context<_, _, Aes256Gcm>` struct              | 400 bytes | 1,048 bytes    |
-| Minimal release binary                         | 561 KB    | **392 KB** (~30% smaller) |
+| `Context<_, _, ChaCha20Poly1305>` struct       | 400 bytes | **88 bytes**                |
+| `Context<_, _, ExportOnly>` struct             | n/a       | **56 bytes**                |
+| `Context<_, _, Aes128Gcm>` struct              | 400 bytes | 792 bytes                   |
+| `Context<_, _, Aes256Gcm>` struct              | 400 bytes | 1,048 bytes                 |
+| Minimal release binary                         | 561 KB    | **392 KB** (~30% smaller)   |
 
 The AES-GCM `Context` rows are larger than `hpke-rs` because the cipher's expanded round keys + GHash table are cached inline — that is what eliminates the per-call AES key-schedule cost in `Context::seal`. Streaming applications using AES-GCM trade memory for throughput here; ChaCha20-Poly1305 is unaffected.
 
@@ -107,13 +107,20 @@ This crate composes RustCrypto primitives. Constant-time properties are inherite
 ## Testing
 
 ```bash
-cargo test                                              # library + roundtrip
-cargo test --features pq                                # + post-quantum tests
-cargo test --features pq,kat-internals                  # + RFC 9180 KAT
-cargo test --features pq,differential,kat-internals     # + cross-impl differential vs hpke-rs
+cargo test                                             # library + roundtrip
+cargo test --features pq                               # + post-quantum tests
+cargo test --features pq --test compile_fail           # + compile-time invariant tests
+cargo test --features pq,kat-internals                 # + RFC 9180 KAT
+cargo test --features pq,differential,kat-internals    # + cross-impl differential vs hpke-rs
 ```
 
-Coverage includes 59 macro-generated roundtrip tests across every ciphersuite × mode combination, four `cargo-fuzz` targets (panics treated as bugs), and differential testing against `hpke-rs` for wire-format interop. The full suite (without differential) runs in under two seconds.
+To regenerate the compile-fail `.stderr` fixtures after an intentional change (e.g. a toolchain bump), run:
+```bash
+TRYBUILD=overwrite cargo test --features pq --test compile_fail
+```
+This rewrites the fixtures unconditionally and should not be used as the normal test invocation.
+
+Coverage includes 59 macro-generated roundtrip tests across every ciphersuite × mode combination, four `cargo-fuzz` targets (panics treated as bugs), differential testing against `hpke-rs` for wire-format interop, compile-fail tests that lock in type-system invariants (`Context` is non-cloneable, `ExportOnly` cannot seal, PQ KEMs cannot authenticate), and unit tests that directly verify the RFC 9180 §5.2 nonce derivation formula (`nonce = base_nonce XOR I2OSP(seq, Nn)`) across specific sequence number boundary values. The full suite (without differential) runs in under two seconds.
 
 ## Migration from `hpke-rs`
 

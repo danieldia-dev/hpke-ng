@@ -212,6 +212,30 @@ mod tests {
 	}
 
 	#[test]
+	fn nonce_derivation_xors_seq_into_base_nonce() {
+		let mut ctx: Ctx = Context::new(vec![0u8; 32], vec![0u8; 12], vec![0u8; 32]).unwrap();
+
+		// seq == 0: nonce must equal base_nonce exactly
+		let n0 = ctx.compute_nonce();
+		assert_eq!(n0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+		// seq == 1: only the last byte changes
+		ctx.set_seq_for_test(1);
+		let n1 = ctx.compute_nonce();
+		assert_eq!(n1, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+		// seq == 256: carry into byte 10
+		ctx.set_seq_for_test(256);
+		let n256 = ctx.compute_nonce();
+		assert_eq!(n256, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+
+		// seq == 0x0102_0304_0506_0708: all 8 trailing bytes affected
+		ctx.set_seq_for_test(0x0102_0304_0506_0708);
+		let n_large = ctx.compute_nonce();
+		assert_eq!(n_large, [0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+	}
+
+	#[test]
 	fn seal_rejects_at_message_limit() {
 		let mut ctx: Ctx = Context::new(vec![0x42u8; 32], vec![0x77u8; 12], vec![0u8; 32]).unwrap();
 		ctx.set_seq_for_test(u64::MAX);

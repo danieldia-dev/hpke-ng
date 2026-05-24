@@ -47,6 +47,7 @@ hpke-rs-rust-crypto = { version = "0.6", features = ["experimental"] }
 hpke-rs-crypto      = "0.6"
 serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"
+trybuild            = { version = "1", features = ["diff"] }
 rand                = "0.9"
 rand_chacha         = "0.9"
 criterion           = { version = "0.8", features = ["html_reports"] }
@@ -59,6 +60,10 @@ codegen-units = 1
 [[test]]
 name = "kat"
 required-features = ["kat-internals"]
+
+[[test]]
+name = "compile_fail"
+required-features = ["pq"]
 
 [[bench]]
 name = "bench"
