@@ -107,12 +107,18 @@ This crate composes RustCrypto primitives. Constant-time properties are inherite
 ## Testing
 
 ```bash
-cargo test                                                          # library + roundtrip
-cargo test --features pq                                            # + post-quantum tests
-TRYBUILD=overwrite cargo test --features pq --test compile_fail     # + compile-time invariant tests
-cargo test --features pq,kat-internals                              # + RFC 9180 KAT
-cargo test --features pq,differential,kat-internals                 # + cross-impl differential vs hpke-rs
+cargo test                                             # library + roundtrip
+cargo test --features pq                               # + post-quantum tests
+cargo test --features pq --test compile_fail           # + compile-time invariant tests
+cargo test --features pq,kat-internals                 # + RFC 9180 KAT
+cargo test --features pq,differential,kat-internals    # + cross-impl differential vs hpke-rs
 ```
+
+To regenerate the compile-fail `.stderr` fixtures after an intentional change (e.g. a toolchain bump), run:
+```bash
+TRYBUILD=overwrite cargo test --features pq --test compile_fail
+```
+This rewrites the fixtures unconditionally and should not be used as the normal test invocation.
 
 Coverage includes 59 macro-generated roundtrip tests across every ciphersuite × mode combination, four `cargo-fuzz` targets (panics treated as bugs), differential testing against `hpke-rs` for wire-format interop, compile-fail tests that lock in type-system invariants (`Context` is non-cloneable, `ExportOnly` cannot seal, PQ KEMs cannot authenticate), and unit tests that directly verify the RFC 9180 §5.2 nonce derivation formula (`nonce = base_nonce XOR I2OSP(seq, Nn)`) across specific sequence number boundary values. The full suite (without differential) runs in under two seconds.
 
