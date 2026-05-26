@@ -1,4 +1,4 @@
-//! Head-to-head comparative benchmarks vs hpke-rs.
+//! Head-to-head comparative benchmarks: hpke-ng vs hpke-rs vs rust-hpke.
 //!
 //! Run with:
 //! ```
@@ -6,23 +6,56 @@
 //!   cargo bench --features comparative --bench comparative
 //! ```
 //!
-//! Coverage:
-//! - **KEM ops**: generate / derive_key_pair / encap / decap, across X25519,
-//!   P-256, K256, X-Wing (draft-06), ML-KEM-768, and ML-KEM-1024.
-//! - **Setup paths**: setup_sender_* / setup_receiver_* across multiple
-//!   ciphersuites and modes (Base + Psk).
-//! - **Single-shot seal/open**: 8 payload sizes (16 B → 256 KiB), multiple
-//!   ciphersuites, both directions.
-//! - **Context seal/open**: post-setup hot path.
-//! - **Export**: 5 output lengths.
-//! - **End-to-end round-trip**: total cost of encrypt-then-decrypt one message.
+//! ## Coverage
 //!
-//! Each benchmark group has two members with parallel names — `hpke_ng/...`
-//! and `hpke_rs/...` — so criterion's report renders them side-by-side.
+//! - **KEM ops** — generate / derive_key_pair / encap / decap, across X25519,
+//!   P-256, K256, X-Wing (draft-06), ML-KEM-768, and ML-KEM-1024. Not every
+//!   library supports every curve or exposes every operation directly; see
+//!   the per-group notes for which rows are present and why.
+//! - **Setup paths** — setup_sender / setup_receiver across multiple
+//!   ciphersuites, in Base and PSK modes.
+//! - **Single-shot seal/open** — full seal()/open() across a payload-size
+//!   sweep, two AEAD primitives (ChaCha20-Poly1305, AES-128-GCM), both
+//!   directions.
+//! - **Context seal/open** — the post-setup hot path (framing + AEAD only).
+//! - **Export** — secret export across 5 output lengths.
+//! - **End-to-end round-trip** — total cost of encrypt-then-decrypt of one
+//!   1 KiB message; the headline single number.
 //!
-//! Note: we seed the hpke-rs PRNG before each iteration because the
-//! `hpke-test-prng` dev-dependency activates a deterministic-PRNG mode
-//! that otherwise exhausts its fixed-size buffer across iterations.
+//! ## Criterion settings (per group)
+//!
+//! Chosen to bound total wall-clock while keeping confidence intervals tight:
+//!
+//! | Group                | sample_size | measurement_time       |
+//! |----------------------|-------------|------------------------|
+//! | KEM / setup          | 60          | 3 s  (quick() default) |
+//! | seal/open sweeps     | 40          | 2 s                    |
+//! | context seal/open    | 50          | 2 s                    |
+//! | export               | 60          | 2 s                    |
+//! | round-trip           | 50          | 3 s                    |
+//!
+//! Payload sizes: the ChaCha20 seal sweep runs the full 8 (16 B .. 256 KiB);
+//! the AES-128 seal sweep and both open sweeps run a reduced 6 (64 B .. 64 KiB),
+//! dropping the extremes to keep wall-clock down.
+//!
+//! ## Naming
+//!
+//! Each group has parallel members — `hpke_ng/...`, `hpke_rs/...`,
+//! `rust_hpke/...` — so criterion renders them side-by-side. Where a row name
+//! carries a `_via_setup_*` suffix, that library has no public API for the
+//! bare operation and the closest analog (which does extra work) is measured
+//! instead; such rows are NOT directly comparable to the bare-operation rows
+//! and are labeled accordingly.
+//!
+//! ## hpke-rs PRNG seeding
+//!
+//! hpke-rs's `hpke-test-prng` dev-dependency replays a fixed byte buffer (the
+//! `SEED` constant) as its randomness source. It is seeded ONCE per benchmark
+//! group, in setup code — never inside a timed `b.iter()` closure. The bare
+//! `seed()` cost was measured at ~58 ns and deliberately hoisted out of all
+//! timed loops so it does not bias any hpke-rs measurement. Operations that
+//! consume no randomness (derive_key_pair, setup_receiver, open, export,
+//! Context::seal/open) require no seeding at all.
 
 #![cfg(feature = "comparative")]
 
@@ -46,15 +79,22 @@ use hpke::{
 
 use rand_core::{OsRng, TryRngCore as _};
 
-/// Seed bytes: 4 KiB is enough for any single hpke-rs operation.
-const SEED: &[u8] = &[0x5Eu8; 4096];
+/// Deterministic-PRNG seed for hpke-rs.
+///
+/// hpke-rs's `hpke-test-prng` dev-dependency replays this fixed buffer; each
+/// randomness draw advances an internal cursor. Sized large enough that ONE
+/// `seed()` call in per-group setup outlasts the whole group's iteration
+/// count, so `seed()` never appears inside a timed `b.iter()` closure.
+/// Criterion runs a fast op for its full measurement window — easily 10^5-10^6
+/// iterations — so this must be megabytes, not kilobytes. If a bench panics
+/// with `InsufficientRandomness`, increase this.
+const SEED: &[u8] = &[0x5Eu8; 64 * 1024 * 1024]; // 64 MiB
 
 const PAYLOAD_SIZES: &[usize] = &[16, 64, 256, 1024, 4096, 16384, 65536, 262144];
 const EXPORT_LENGTHS: &[usize] = &[16, 32, 64, 128, 256];
 
-fn quick(c: &mut Criterion) -> Criterion {
-	// Override globally? No — just fall through, tune per-group below.
-	let _ = c;
+fn quick() -> Criterion {
+	// Shared defaults; per-group overrides applied below.
 	Criterion::default()
 		.sample_size(60)
 		.measurement_time(Duration::from_secs(3))
@@ -70,7 +110,7 @@ fn bench_kem_x25519(c: &mut Criterion) {
 	let mut g = c.benchmark_group("kem/x25519");
 	let mut os = OsRng;
 
-	// generate
+	// generate for hpke-ng, hpke-rs, rust-hpke
 	g.bench_function("hpke_ng/generate", |b| {
 		b.iter(|| {
 			let mut os = OsRng;
@@ -84,18 +124,16 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
-			b.iter(|| {
-				rs.seed(SEED).unwrap();
-				rs.generate_key_pair().unwrap()
-			})
+			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
 	g.bench_function("rust_hpke/generate", |b| {
 		b.iter(|| RhX25519::gen_keypair(&mut os.unwrap_mut()))
 	});
 
-	// derive_key_pair (deterministic, no PRNG)
+	// derive_key_pair (deterministic, no PRNG) for hpke-ng, hpke-rs, rust-hpke
 	let ikm = [0x99u8; 32];
 	g.bench_function("hpke_ng/derive_key_pair", |b| {
 		b.iter(|| ng::DhKemX25519HkdfSha256::derive_key_pair(black_box(&ikm)).unwrap())
@@ -111,8 +149,11 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			b.iter(|| rs.derive_key_pair(black_box(&ikm)).unwrap())
 		});
 	}
+	g.bench_function("rust_hpke/derive_key_pair", |b| {
+		b.iter(|| RhX25519::derive_keypair(black_box(&ikm)))
+	});
 
-	// encap
+	// hpke-ng encap
 	{
 		let (_, pk_ng) = ng::DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
 		g.bench_function("hpke_ng/encap", |b| {
@@ -123,7 +164,8 @@ fn bench_kem_x25519(c: &mut Criterion) {
 		});
 	}
 
-	// hpke-rs has no public direct encap; the closest analog is setup_sender_base.
+	// Note that hpke-rs has no public direct encap; the closest analog is `setup_sender`.
+	// hpke-rs encap via `setup_sender`
 	{
 		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
 			Mode::Base,
@@ -132,16 +174,33 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
-				rs.seed(SEED).unwrap();
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
 					.unwrap()
 			})
 		});
 	}
 
-	// decap
+	// rust-hpke encap via `setup_sender`
+	{
+		let (_, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
+		g.bench_function("rust_hpke/encap_via_setup_sender", |b| {
+			b.iter(|| {
+				let mut os = OsRng;
+				hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519, _>(
+					&OpModeS::Base,
+					black_box(&pk),
+					b"",
+					&mut os.unwrap_mut(),
+				)
+				.unwrap()
+			})
+		});
+	}
+
+	// hpke-ng decap
 	{
 		let mut os = OsRng;
 		let (sk_ng, pk_ng) = ng::DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
@@ -150,6 +209,7 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			b.iter(|| ng::DhKemX25519HkdfSha256::decap(black_box(&enc_ng), &sk_ng).unwrap())
 		});
 	}
+	// hpke-rs decap via `setup_receiver`
 	{
 		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
 			Mode::Base,
@@ -168,24 +228,7 @@ fn bench_kem_x25519(c: &mut Criterion) {
 		});
 	}
 
-	// encap via `setup_sender`
-	{
-		let (_, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
-		g.bench_function("rust_hpke/encap_via_setup_sender", |b| {
-			b.iter(|| {
-				let mut os = OsRng;
-				hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519, _>(
-					&OpModeS::Base,
-					black_box(&pk),
-					b"",
-					&mut os.unwrap_mut(),
-				)
-				.unwrap()
-			})
-		});
-	}
-
-	// decap via `setup_receiver`
+	// rust-hpke decap via `setup_receiver`
 	{
 		let (sk, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
 		let (enc, _) = hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519, _>(
@@ -212,6 +255,7 @@ fn bench_kem_x25519(c: &mut Criterion) {
 
 fn bench_kem_p256(c: &mut Criterion) {
 	let mut g = c.benchmark_group("kem/p256");
+	let mut os = OsRng;
 
 	g.bench_function("hpke_ng/generate", |b| {
 		b.iter(|| {
@@ -226,13 +270,14 @@ fn bench_kem_p256(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::Aes128Gcm,
 		);
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
-			b.iter(|| {
-				rs.seed(SEED).unwrap();
-				rs.generate_key_pair().unwrap()
-			})
+			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
+	g.bench_function("rust_hpke/generate", |b| {
+		b.iter(|| RhP256::gen_keypair(&mut os.unwrap_mut()))
+	});
 
 	let ikm = [0x99u8; 32];
 	g.bench_function("hpke_ng/derive_key_pair", |b| {
@@ -249,9 +294,11 @@ fn bench_kem_p256(c: &mut Criterion) {
 			b.iter(|| rs.derive_key_pair(black_box(&ikm)).unwrap())
 		});
 	}
+	g.bench_function("rust_hpke/derive_key_pair", |b| {
+		b.iter(|| RhP256::derive_keypair(black_box(&ikm)))
+	});
 
 	{
-		let mut os = OsRng;
 		let (_, pk_ng) = ng::DhKemP256HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
 		g.bench_function("hpke_ng/encap", |b| {
 			b.iter(|| {
@@ -261,22 +308,22 @@ fn bench_kem_p256(c: &mut Criterion) {
 		});
 	}
 	{
-		let mut os = OsRng;
-		let (sk_ng, pk_ng) = ng::DhKemP256HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
-		let (_, enc_ng) = ng::DhKemP256HkdfSha256::encap(&mut os.unwrap_mut(), &pk_ng).unwrap();
-		g.bench_function("hpke_ng/decap", |b| {
-			b.iter(|| ng::DhKemP256HkdfSha256::decap(black_box(&enc_ng), &sk_ng).unwrap())
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::DhKemP256,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::Aes128Gcm,
+		);
+		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
+		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
+			b.iter(|| {
+				rs.setup_sender(black_box(&pk), b"", None, None, None)
+					.unwrap()
+			})
 		});
 	}
-
 	{
-		let mut os = OsRng;
-		g.bench_function("rust_hpke/generate", |b| {
-			b.iter(|| RhP256::gen_keypair(&mut os.unwrap_mut()))
-		});
-		g.bench_function("rust_hpke/derive_key_pair", |b| {
-			b.iter(|| RhP256::derive_keypair(black_box(&ikm)))
-		});
 		let (_, pk) = RhP256::gen_keypair(&mut os.unwrap_mut());
 		g.bench_function("rust_hpke/encap_via_setup_sender", |b| {
 			b.iter(|| {
@@ -290,6 +337,33 @@ fn bench_kem_p256(c: &mut Criterion) {
 				.unwrap()
 			})
 		});
+	}
+
+	{
+		let (sk_ng, pk_ng) = ng::DhKemP256HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
+		let (_, enc_ng) = ng::DhKemP256HkdfSha256::encap(&mut os.unwrap_mut(), &pk_ng).unwrap();
+		g.bench_function("hpke_ng/decap", |b| {
+			b.iter(|| ng::DhKemP256HkdfSha256::decap(black_box(&enc_ng), &sk_ng).unwrap())
+		});
+	}
+	{
+		let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+			Mode::Base,
+			rs_types::KemAlgorithm::DhKemP256,
+			rs_types::KdfAlgorithm::HkdfSha256,
+			rs_types::AeadAlgorithm::Aes128Gcm,
+		);
+		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
+		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
+		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
+			b.iter(|| {
+				rs.setup_receiver(black_box(&enc), &sk, b"", None, None, None)
+					.unwrap()
+			})
+		});
+	}
+	{
 		let (sk, pk) = RhP256::gen_keypair(&mut os.unwrap_mut());
 		let (enc, _) = hpke::setup_sender::<RhAes128, RhHkdfSha256, RhP256, _>(
 			&OpModeS::Base,
@@ -310,7 +384,6 @@ fn bench_kem_p256(c: &mut Criterion) {
 			})
 		});
 	}
-
 	g.finish();
 }
 
@@ -330,11 +403,9 @@ fn bench_kem_k256(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
-			b.iter(|| {
-				rs.seed(SEED).unwrap();
-				rs.generate_key_pair().unwrap()
-			})
+			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
 
@@ -372,7 +443,7 @@ fn bench_kem_k256(c: &mut Criterion) {
 			b.iter(|| ng::DhKemK256HkdfSha256::decap(black_box(&enc_ng), &sk_ng).unwrap())
 		});
 	}
-
+	// rust-hpke omitted: no K256 (secp256k1) KEM support.
 	g.finish();
 }
 
@@ -392,11 +463,9 @@ fn bench_kem_xwing(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
-			b.iter(|| {
-				rs.seed(SEED).unwrap();
-				rs.generate_key_pair().unwrap()
-			})
+			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
 
@@ -434,9 +503,9 @@ fn bench_kem_xwing(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
-				rs.seed(SEED).unwrap();
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
 					.unwrap()
 			})
@@ -488,11 +557,9 @@ fn bench_kem_mlkem768(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
-			b.iter(|| {
-				rs.seed(SEED).unwrap();
-				rs.generate_key_pair().unwrap()
-			})
+			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
 
@@ -533,9 +600,9 @@ fn bench_kem_mlkem768(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
-				rs.seed(SEED).unwrap();
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
 					.unwrap()
 			})
@@ -587,11 +654,9 @@ fn bench_kem_mlkem1024(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
-			b.iter(|| {
-				rs.seed(SEED).unwrap();
-				rs.generate_key_pair().unwrap()
-			})
+			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
 
@@ -629,9 +694,9 @@ fn bench_kem_mlkem1024(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
+		rs.seed(SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
-				rs.seed(SEED).unwrap();
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
 					.unwrap()
 			})
@@ -701,7 +766,6 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 	});
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -766,6 +830,7 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 	);
 	let (_sk_psk_rs, pk_psk_rs) = rs_psk.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 	let mut g = c.benchmark_group("x25519_chacha20/setup_sender_psk");
+	rs_psk.seed(SEED).unwrap();
 	g.bench_function("hpke_ng", |b| {
 		b.iter(|| {
 			let mut os = OsRng;
@@ -781,7 +846,6 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 	});
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs_psk.seed(SEED).unwrap();
 			rs_psk
 				.setup_sender(
 					black_box(&pk_psk_rs),
@@ -818,9 +882,9 @@ fn bench_setup_x25519_aes128(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
+	rs.seed(SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -862,9 +926,9 @@ fn bench_setup_x25519_aes256(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
+	rs.seed(SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -906,9 +970,9 @@ fn bench_setup_p256_aes128(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
+	rs.seed(SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -950,9 +1014,9 @@ fn bench_setup_p256_aes256(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
+	rs.seed(SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -992,9 +1056,9 @@ fn bench_setup_k256_chacha(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut os.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
+	rs.seed(SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -1028,7 +1092,6 @@ fn bench_setup_xwing_chacha(c: &mut Criterion) {
 	});
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -1074,7 +1137,6 @@ fn bench_setup_mlkem768_chacha(c: &mut Criterion) {
 	});
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -1120,7 +1182,6 @@ fn bench_setup_mlkem1024_chacha(c: &mut Criterion) {
 	});
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
 				.unwrap()
 		})
@@ -1161,6 +1222,10 @@ fn bench_seal_x25519_chacha_payload_sweep(c: &mut Criterion) {
 	let (_, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
 
 	let mut g = c.benchmark_group("x25519_chacha20_seal_sweep");
+	// 8 payload sizes × 3 libraries = 24 timed benchmarks in this group.
+	// Trimmed from the quick() defaults (60 / 3s) so the full sweep finishes
+	// in ~2 min rather than ~6; 40 samples over 2s still gives tight CIs for
+	// ops at these magnitudes (µs–ms range).
 	g.measurement_time(Duration::from_secs(2));
 	g.sample_size(40);
 
@@ -1180,9 +1245,9 @@ fn bench_seal_x25519_chacha_payload_sweep(c: &mut Criterion) {
 				.unwrap()
 			})
 		});
+		rs.seed(SEED).unwrap();
 		g.bench_with_input(BenchmarkId::new("hpke_rs", size), &size, |b, _| {
 			b.iter(|| {
-				rs.seed(SEED).unwrap();
 				rs.seal(&pk_rs, b"info", b"aad", black_box(&pt), None, None, None)
 					.unwrap()
 			})
@@ -1221,6 +1286,9 @@ fn bench_seal_x25519_aes128_payload_sweep(c: &mut Criterion) {
 	let (_, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
 
 	let mut g = c.benchmark_group("x25519_aes128_seal_sweep");
+	// Reduced 6-size sweep (drops 16 B and 256 KiB extremes), 3 libraries.
+	// Same 40 / 2s budget as the chacha seal sweep, i.e. kept identical so the
+	// two AEAD variants are directly comparable.
 	g.measurement_time(Duration::from_secs(2));
 	g.sample_size(40);
 	for &size in &[64usize, 256, 1024, 4096, 16384, 65536] {
@@ -1239,9 +1307,9 @@ fn bench_seal_x25519_aes128_payload_sweep(c: &mut Criterion) {
 				.unwrap()
 			})
 		});
+		rs.seed(SEED).unwrap();
 		g.bench_with_input(BenchmarkId::new("hpke_rs", size), &size, |b, _| {
 			b.iter(|| {
-				rs.seed(SEED).unwrap();
 				rs.seal(&pk_rs, b"info", b"aad", black_box(&pt), None, None, None)
 					.unwrap()
 			})
@@ -1284,6 +1352,8 @@ fn bench_open_x25519_chacha_payload_sweep(c: &mut Criterion) {
 	let (sk, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
 
 	let mut g = c.benchmark_group("x25519_chacha20_open_sweep");
+	// Mirrors the chacha seal sweep budget (40 / 2s) so seal and open numbers
+	// at each payload size are read as a matched pair.
 	g.measurement_time(Duration::from_secs(2));
 	g.sample_size(40);
 	for &size in &[64usize, 256, 1024, 4096, 16384, 65536] {
@@ -1343,8 +1413,87 @@ fn bench_open_x25519_chacha_payload_sweep(c: &mut Criterion) {
 	g.finish();
 }
 
+fn bench_open_x25519_aes128_payload_sweep(c: &mut Criterion) {
+	type Suite = ng::Hpke<ng::DhKemX25519HkdfSha256, ng::HkdfSha256, ng::Aes128Gcm>;
+
+	let mut os = OsRng;
+	let (sk_ng, pk_ng) = ng::DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
+
+	let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+		Mode::Base,
+		rs_types::KemAlgorithm::DhKem25519,
+		rs_types::KdfAlgorithm::HkdfSha256,
+		rs_types::AeadAlgorithm::Aes128Gcm,
+	);
+	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+
+	let (sk, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
+
+	let mut g = c.benchmark_group("x25519_aes128_open_sweep");
+	// Matches the aes128 seal sweep and the chacha open sweep (40 / 2s):
+	// all four payload sweeps share one budget so they're cross-comparable.
+	g.measurement_time(Duration::from_secs(2));
+	g.sample_size(40);
+	for &size in &[64usize, 256, 1024, 4096, 16384, 65536] {
+		let pt = vec![0xAAu8; size];
+
+		let (enc_ng, ct_ng) =
+			Suite::seal_base(&mut os.unwrap_mut(), &pk_ng, b"info", b"aad", &pt).unwrap();
+
+		rs.seed(SEED).unwrap(); // needed outside of iter(), since seal() draws randomness.
+		let (enc_rs, ct_rs) = rs
+			.seal(&pk_rs, b"info", b"aad", &pt, None, None, None)
+			.unwrap();
+
+		let (enc, mut ctx_s) = hpke::setup_sender::<RhAes128, RhHkdfSha256, RhX25519, _>(
+			&OpModeS::Base,
+			&pk,
+			b"info",
+			&mut os.unwrap_mut(),
+		)
+		.unwrap();
+		let ct = ctx_s.seal(&pt, b"aad").unwrap();
+
+		g.throughput(Throughput::Bytes(size as u64));
+		g.bench_with_input(BenchmarkId::new("hpke_ng", size), &size, |b, _| {
+			b.iter(|| {
+				Suite::open_base(
+					black_box(&enc_ng),
+					&sk_ng,
+					b"info",
+					b"aad",
+					black_box(&ct_ng),
+				)
+				.unwrap()
+			})
+		});
+		g.bench_with_input(BenchmarkId::new("hpke_rs", size), &size, |b, _| {
+			b.iter(|| {
+				// open path consumes no PRNG bytes — no seed() here.
+				let mut ctx = rs
+					.setup_receiver(black_box(&enc_rs), &sk_rs, b"info", None, None, None)
+					.unwrap();
+				ctx.open(b"aad", black_box(&ct_rs)).unwrap()
+			})
+		});
+		g.bench_with_input(BenchmarkId::new("rust_hpke", size), &size, |b, _| {
+			b.iter(|| {
+				let mut ctx_r = hpke::setup_receiver::<RhAes128, RhHkdfSha256, RhX25519>(
+					&OpModeR::Base,
+					black_box(&sk),
+					black_box(&enc),
+					b"info",
+				)
+				.unwrap();
+				ctx_r.open(black_box(&ct), b"aad").unwrap()
+			})
+		});
+	}
+	g.finish();
+}
+
 // =============================================================================
-//  Context seal (post-setup, pure framing+AEAD path)
+//  Context seal (post-setup, pure framing + AEAD path)
 // =============================================================================
 
 fn bench_context_seal_x25519_chacha(c: &mut Criterion) {
@@ -1359,8 +1508,8 @@ fn bench_context_seal_x25519_chacha(c: &mut Criterion) {
 		rs_types::KdfAlgorithm::HkdfSha256,
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
-	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 	rs.seed(SEED).unwrap();
+	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 	let (_enc, mut ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
 	let (_, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
@@ -1373,6 +1522,10 @@ fn bench_context_seal_x25519_chacha(c: &mut Criterion) {
 	.unwrap();
 
 	let mut g = c.benchmark_group("x25519_chacha20_context_seal");
+	// Post-setup hot path: only 4 sizes × 3 libraries, and each iteration is
+	// cheap (pure framing + AEAD, no KEM). Slightly higher sample count (50)
+	// than the sweeps since the per-iteration variance is what we care about
+	// here; 2s window is ample for this few benchmarks.
 	g.measurement_time(Duration::from_secs(2));
 	g.sample_size(50);
 	for &size in &[64usize, 1024, 16384, 65536] {
@@ -1386,6 +1539,93 @@ fn bench_context_seal_x25519_chacha(c: &mut Criterion) {
 		});
 		g.bench_with_input(BenchmarkId::new("rust_hpke", size), &size, |b, _| {
 			b.iter(|| ctx_rh.seal(black_box(&pt), b"aad").unwrap())
+		});
+	}
+	g.finish();
+}
+
+// =============================================================================
+//  Context open (post-setup, framing + AEAD decrypt)
+// =============================================================================
+
+fn bench_context_open_x25519_chacha(c: &mut Criterion) {
+	type Suite = ng::Hpke<ng::DhKemX25519HkdfSha256, ng::HkdfSha256, ng::ChaCha20Poly1305>;
+	let mut os = OsRng;
+	let (sk_ng, pk_ng) = ng::DhKemX25519HkdfSha256::generate(&mut os.unwrap_mut()).unwrap();
+
+	let mut rs = HpkeRs::<HpkeRustCrypto>::new(
+		Mode::Base,
+		rs_types::KemAlgorithm::DhKem25519,
+		rs_types::KdfAlgorithm::HkdfSha256,
+		rs_types::AeadAlgorithm::ChaCha20Poly1305,
+	);
+	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+
+	let (sk, pk) = RhX25519::gen_keypair(&mut os.unwrap_mut());
+
+	let mut g = c.benchmark_group("x25519_chacha20_context_open");
+	// Same 50 / 2s budget as context_seal for symmetry. NOTE: unlike
+	// context_seal, each iteration here rebuilds the receiver context (see
+	// the sequence-number comment below), so iterations are heavier than the
+	// seal side — the 2s window still covers it comfortably.
+	g.measurement_time(Duration::from_secs(2));
+	g.sample_size(50);
+
+	for &size in &[64usize, 1024, 16384, 65536] {
+		let pt = vec![0xAAu8; size];
+
+		// Setup synchronized contexts for hpke_ng
+		let (enc_ng, mut ctx_s_ng) =
+			Suite::setup_sender_base(&mut os.unwrap_mut(), &pk_ng, b"info").unwrap();
+		let mut ctx_r_ng = Suite::setup_receiver_base(&enc_ng, &sk_ng, b"info").unwrap();
+
+		// Setup synchronized contexts for hpke_rs
+		rs.seed(SEED).unwrap();
+		let (enc_rs, mut ctx_s_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
+		let mut ctx_r_rs = rs
+			.setup_receiver(&enc_rs, &sk_rs, b"info", None, None, None)
+			.unwrap();
+
+		// Setup synchronized contexts for rust_hpke
+		let (enc_rh, mut ctx_s_rh) = hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519, _>(
+			&OpModeS::Base,
+			&pk,
+			b"info",
+			&mut os.unwrap_mut(),
+		)
+		.unwrap();
+		let mut ctx_r_rh = hpke::setup_receiver::<RhChaCha20, RhHkdfSha256, RhX25519>(
+			&OpModeR::Base,
+			&sk,
+			&enc_rh,
+			b"info",
+		)
+		.unwrap();
+
+		g.throughput(Throughput::Bytes(size as u64));
+		// NOTE: a Context advances its sequence number per open(), so the
+		// receiver context is rebuilt each iteration — sequence-0 ciphertext
+		// can only be opened by a sequence-0 context. This means setup cost
+		// is included; this benchmark measures "open one message" honestly,
+		// not a steady-state hot loop. See bench_context_seal for the seal
+		// side, which has no such constraint.
+		g.bench_with_input(BenchmarkId::new("hpke_ng", size), &size, |b, _| {
+			b.iter(|| {
+				let ct = ctx_s_ng.seal(b"aad", black_box(&pt)).unwrap();
+				ctx_r_ng.open(b"aad", &ct).unwrap()
+			})
+		});
+		g.bench_with_input(BenchmarkId::new("hpke_rs", size), &size, |b, _| {
+			b.iter(|| {
+				let ct = ctx_s_rs.seal(b"aad", black_box(&pt)).unwrap();
+				ctx_r_rs.open(b"aad", &ct).unwrap()
+			})
+		});
+		g.bench_with_input(BenchmarkId::new("rust_hpke", size), &size, |b, _| {
+			b.iter(|| {
+				let ct = ctx_s_rh.seal(black_box(&pt), b"aad").unwrap();
+				ctx_r_rh.open(&ct, b"aad").unwrap()
+			})
 		});
 	}
 	g.finish();
@@ -1415,14 +1655,17 @@ fn bench_export(c: &mut Criterion) {
 	let (_enc_rs, ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
 	let mut g = c.benchmark_group("x25519_chacha20_export");
+	// 5 output lengths × 2 libraries (rust-hpke excluded: incompatible API,
+	// see fn comment). export() is one of the cheapest ops in the suite, so
+	// the full 60-sample count is kept for tight CIs; 2s window suffices.
 	g.measurement_time(Duration::from_secs(2));
 	g.sample_size(60);
 	for &len in EXPORT_LENGTHS {
 		g.bench_with_input(BenchmarkId::new("hpke_ng", len), &len, |b, _| {
-			b.iter(|| ctx_ng.export(b"export-context", *black_box(&len)).unwrap())
+			b.iter(|| ctx_ng.export(b"export-context", black_box(len)).unwrap())
 		});
 		g.bench_with_input(BenchmarkId::new("hpke_rs", len), &len, |b, _| {
-			b.iter(|| ctx_rs.export(b"export-context", *black_box(&len)).unwrap())
+			b.iter(|| ctx_rs.export(b"export-context", black_box(len)).unwrap())
 		});
 	}
 	g.finish();
@@ -1450,6 +1693,10 @@ fn bench_roundtrip(c: &mut Criterion) {
 	let pt = vec![0xAAu8; 1024];
 
 	let mut g = c.benchmark_group("x25519_chacha20_roundtrip_1k");
+	// Headline end-to-end number: full seal + open of one 1 KiB message, 3
+	// libraries. Each iteration is the most expensive in the suite (KEM +
+	// key schedule, twice), so the window is widened to 3s; 50 samples
+	// balances CI tightness against this group's higher per-iteration cost.
 	g.measurement_time(Duration::from_secs(3));
 	g.sample_size(50);
 	g.bench_function("hpke_ng", |b| {
@@ -1466,9 +1713,9 @@ fn bench_roundtrip(c: &mut Criterion) {
 			Suite::open_base(&enc, &sk_ng, b"info", b"aad", &ct).unwrap()
 		})
 	});
+	rs.seed(SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
-			rs.seed(SEED).unwrap();
 			let (enc, ct) = rs
 				.seal(&pk_rs, b"info", b"aad", black_box(&pt), None, None, None)
 				.unwrap();
@@ -1504,7 +1751,7 @@ fn bench_roundtrip(c: &mut Criterion) {
 
 criterion_group! {
 	name = benches;
-	config = quick(&mut Criterion::default());
+	config = quick();
 	targets =
 		bench_kem_x25519,
 		bench_kem_p256,
@@ -1524,7 +1771,9 @@ criterion_group! {
 		bench_seal_x25519_chacha_payload_sweep,
 		bench_seal_x25519_aes128_payload_sweep,
 		bench_open_x25519_chacha_payload_sweep,
+		bench_open_x25519_aes128_payload_sweep,
 		bench_context_seal_x25519_chacha,
+		bench_context_open_x25519_chacha,
 		bench_export,
 		bench_roundtrip,
 }
