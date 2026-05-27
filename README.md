@@ -132,6 +132,10 @@ Three mechanical steps, typically under an hour for a real codebase:
 
 See the [announcement post](https://symbolic.software/blog/2026-05-08-hpke-ng/) for a worked example.
 
+## Authors
+
+hpke-ng is a joint project between [Nadim Kobeissi](https://nadim.computer) and [Daniel Dia](https://danieldia.me).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
