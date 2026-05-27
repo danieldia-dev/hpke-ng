@@ -12,8 +12,10 @@
 //!   P-256, K256, X-Wing (draft-06), ML-KEM-768, and ML-KEM-1024. Not every
 //!   library supports every curve or exposes every operation directly; see
 //!   the per-group notes for which rows are present and why.
-//! - **Setup paths** — setup_sender / setup_receiver across multiple
-//!   ciphersuites, in Base and PSK modes.
+//! - **Setup paths** — setup_sender across all ciphersuites; setup_receiver
+//!   for x25519/chacha20 and the three PQ suites (X-Wing, ML-KEM-768,
+//!   ML-KEM-1024). PSK mode covered for x25519/chacha20 across all three
+//!   libraries.
 //! - **Single-shot seal/open** — full seal()/open() across a payload-size
 //!   sweep, two AEAD primitives (ChaCha20-Poly1305, AES-128-GCM), both
 //!   directions.
@@ -65,6 +67,7 @@
 #![cfg(feature = "comparative")]
 
 use std::hint::black_box;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -76,7 +79,7 @@ use hpke_rs_crypto::types as rs_types;
 use hpke_rs_rust_crypto::HpkeRustCrypto;
 
 use hpke::{
-	Kem as RustHpkeKem, OpModeR, OpModeS,
+	Kem as _, OpModeR, OpModeS, PskBundle,
 	aead::{AesGcm128 as RhAes128, AesGcm256 as RhAes256, ChaCha20Poly1305 as RhChaCha20},
 	kdf::HkdfSha256 as RhHkdfSha256,
 	kem::{DhP256HkdfSha256 as RhP256, X25519HkdfSha256 as RhX25519},
@@ -94,7 +97,7 @@ use rand_core::TryRngCore as _;
 /// Criterion runs a fast op for its full measurement window — easily 10^5-10^6
 /// iterations — so this must be megabytes, not kilobytes. If a bench panics
 /// with `InsufficientRandomness`, increase this.
-const SEED: &[u8] = &[0x5Eu8; 64 * 1024 * 1024]; // 64 MiB
+static SEED: LazyLock<Vec<u8>> = LazyLock::new(|| vec![0x5Eu8; 64 * 1024 * 1024]); // 64 MiB
 
 const PAYLOAD_SIZES: &[usize] = &[16, 64, 256, 1024, 4096, 16384, 65536, 262144];
 const EXPORT_LENGTHS: &[usize] = &[16, 32, 64, 128, 256];
@@ -136,7 +139,7 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
@@ -184,7 +187,7 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
@@ -226,7 +229,7 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
 		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
 			b.iter(|| {
@@ -275,7 +278,7 @@ fn bench_kem_p256(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::Aes128Gcm,
 		);
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
@@ -319,7 +322,7 @@ fn bench_kem_p256(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::Aes128Gcm,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
@@ -357,7 +360,7 @@ fn bench_kem_p256(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::Aes128Gcm,
 		);
 		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
 		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
 			b.iter(|| {
@@ -404,7 +407,7 @@ fn bench_kem_k256(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
@@ -441,7 +444,8 @@ fn bench_kem_k256(c: &mut Criterion) {
 			b.iter(|| ng::DhKemK256HkdfSha256::decap(black_box(&enc_ng), &sk_ng).unwrap())
 		});
 	}
-	// rust-hpke omitted: no K256 (secp256k1) KEM support.
+	// rust-hpke omitted: K256 (secp256k1) is not in the HPKE RFC and has never been
+	// added to rust-hpke; the library only implements the curves listed in RFC 9180.
 	g.finish();
 }
 
@@ -459,7 +463,7 @@ fn bench_kem_xwing(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
@@ -495,7 +499,7 @@ fn bench_kem_xwing(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
@@ -519,7 +523,7 @@ fn bench_kem_xwing(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
 		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
 			b.iter(|| {
@@ -529,6 +533,8 @@ fn bench_kem_xwing(c: &mut Criterion) {
 		});
 	}
 
+	// rust-hpke omitted: X-Wing (MLKEM768-X25519) was added in commit 7620fa7,
+	// released as v0.14.0-pre.1. The project currently pins to v0.13.
 	g.finish();
 }
 
@@ -546,7 +552,7 @@ fn bench_kem_mlkem768(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
@@ -585,7 +591,7 @@ fn bench_kem_mlkem768(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
@@ -609,7 +615,7 @@ fn bench_kem_mlkem768(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
 		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
 			b.iter(|| {
@@ -619,6 +625,9 @@ fn bench_kem_mlkem768(c: &mut Criterion) {
 		});
 	}
 
+	// rust-hpke omitted: rust-hpke does not implement standalone ML-KEM-768; only the
+	// ML-KEM-768+X25519 (X-Wing, v0.14.0-pre.1) and ML-KEM-768+P256 (v0.14.0-pre.2)
+	// hybrid KEMs are supported.
 	g.finish();
 }
 
@@ -636,7 +645,7 @@ fn bench_kem_mlkem1024(c: &mut Criterion) {
 			rs_types::KdfAlgorithm::HkdfSha256,
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/generate", |b| {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
@@ -672,7 +681,7 @@ fn bench_kem_mlkem1024(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (_sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_function("hpke_rs/encap_via_setup_sender", |b| {
 			b.iter(|| {
 				rs.setup_sender(black_box(&pk), b"", None, None, None)
@@ -696,7 +705,7 @@ fn bench_kem_mlkem1024(c: &mut Criterion) {
 			rs_types::AeadAlgorithm::ChaCha20Poly1305,
 		);
 		let (sk, pk) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		let (enc, _ctx) = rs.setup_sender(&pk, b"", None, None, None).unwrap();
 		g.bench_function("hpke_rs/decap_via_setup_receiver", |b| {
 			b.iter(|| {
@@ -706,6 +715,9 @@ fn bench_kem_mlkem1024(c: &mut Criterion) {
 		});
 	}
 
+	// rust-hpke omitted: rust-hpke does not implement standalone ML-KEM-1024; only
+	// ML-KEM-768-based hybrids are supported (X-Wing and MLKEM768-P256), and neither
+	// includes an ML-KEM-1024 variant.
 	g.finish();
 }
 
@@ -727,7 +739,7 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
 	let (_, pk) = RhX25519::gen_keypair(&mut prng.unwrap_mut());
@@ -804,8 +816,9 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
 	let (_sk_psk_rs, pk_psk_rs) = rs_psk.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
+	let (_, pk_psk_rh) = RhX25519::gen_keypair(&mut prng.unwrap_mut());
 	let mut g = c.benchmark_group("x25519_chacha20/setup_sender_psk");
-	rs_psk.seed(SEED).unwrap();
+	rs_psk.seed(&SEED).unwrap();
 	g.bench_function("hpke_ng", |b| {
 		b.iter(|| {
 			Suite::setup_sender_psk(
@@ -829,6 +842,17 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 					None,
 				)
 				.unwrap()
+		})
+	});
+	g.bench_function("rust_hpke", |b| {
+		b.iter(|| {
+			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519, _>(
+				&OpModeS::Psk(PskBundle::new(&psk, psk_id).unwrap()),
+				black_box(&pk_psk_rh),
+				b"info",
+				&mut prng.unwrap_mut(),
+			)
+			.unwrap()
 		})
 	});
 	g.finish();
@@ -855,7 +879,7 @@ fn bench_setup_x25519_aes128(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut prng.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
@@ -897,7 +921,7 @@ fn bench_setup_x25519_aes256(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut prng.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
@@ -939,7 +963,7 @@ fn bench_setup_p256_aes128(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut prng.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
@@ -981,7 +1005,7 @@ fn bench_setup_p256_aes256(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut prng.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
@@ -1021,7 +1045,7 @@ fn bench_setup_k256_chacha(c: &mut Criterion) {
 			Suite::setup_sender_base(&mut prng.unwrap_mut(), black_box(&pk_ng), b"info").unwrap()
 		})
 	});
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
 			rs.setup_sender(black_box(&pk_rs), b"info", None, None, None)
@@ -1045,7 +1069,7 @@ fn bench_setup_xwing_chacha(c: &mut Criterion) {
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
 	let mut g = c.benchmark_group("xwing_chacha20/setup_sender_base");
@@ -1060,6 +1084,8 @@ fn bench_setup_xwing_chacha(c: &mut Criterion) {
 				.unwrap()
 		})
 	});
+	// rust-hpke omitted: X-Wing (MLKEM768-X25519) was added in commit 7620fa7,
+	// released as v0.14.0-pre.1; the project currently pins to v0.13.
 	g.finish();
 
 	let mut g = c.benchmark_group("xwing_chacha20/setup_receiver_base");
@@ -1072,6 +1098,8 @@ fn bench_setup_xwing_chacha(c: &mut Criterion) {
 				.unwrap()
 		})
 	});
+	// rust-hpke omitted: X-Wing (MLKEM768-X25519) was added in commit 7620fa7,
+	// released as v0.14.0-pre.1; the project currently pins to v0.13.
 	g.finish();
 }
 
@@ -1089,7 +1117,7 @@ fn bench_setup_mlkem768_chacha(c: &mut Criterion) {
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
 	let mut g = c.benchmark_group("mlkem768_chacha20/setup_sender_base");
@@ -1116,6 +1144,8 @@ fn bench_setup_mlkem768_chacha(c: &mut Criterion) {
 				.unwrap()
 		})
 	});
+	// rust-hpke omitted: standalone ML-KEM-768 is not implemented; rust-hpke only supports
+	// the ML-KEM-768+X25519 (X-Wing, v0.14.0-pre.1) and ML-KEM-768+P256 (v0.14.0-pre.2) hybrids.
 	g.finish();
 }
 
@@ -1133,7 +1163,7 @@ fn bench_setup_mlkem1024_chacha(c: &mut Criterion) {
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 64]).unwrap().into_keys();
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
 	let mut g = c.benchmark_group("mlkem1024_chacha20/setup_sender_base");
@@ -1160,6 +1190,8 @@ fn bench_setup_mlkem1024_chacha(c: &mut Criterion) {
 				.unwrap()
 		})
 	});
+	// rust-hpke omitted: standalone ML-KEM-1024 is not implemented; rust-hpke only supports
+	// ML-KEM-768-based hybrids (X-Wing and MLKEM768-P256), with no ML-KEM-1024 variant.
 	g.finish();
 }
 
@@ -1206,7 +1238,7 @@ fn bench_seal_x25519_chacha_payload_sweep(c: &mut Criterion) {
 				.unwrap()
 			})
 		});
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_with_input(BenchmarkId::new("hpke_rs", size), &size, |b, _| {
 			b.iter(|| {
 				rs.seal(&pk_rs, b"info", b"aad", black_box(&pt), None, None, None)
@@ -1266,7 +1298,7 @@ fn bench_seal_x25519_aes128_payload_sweep(c: &mut Criterion) {
 				.unwrap()
 			})
 		});
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		g.bench_with_input(BenchmarkId::new("hpke_rs", size), &size, |b, _| {
 			b.iter(|| {
 				rs.seal(&pk_rs, b"info", b"aad", black_box(&pt), None, None, None)
@@ -1320,7 +1352,7 @@ fn bench_open_x25519_chacha_payload_sweep(c: &mut Criterion) {
 		let (enc_ng, ct_ng) =
 			Suite::seal_base(&mut prng.unwrap_mut(), &pk_ng, b"info", b"aad", &pt).unwrap();
 
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		let (enc_rs, ct_rs) = rs
 			.seal(&pk_rs, b"info", b"aad", &pt, None, None, None)
 			.unwrap();
@@ -1398,7 +1430,7 @@ fn bench_open_x25519_aes128_payload_sweep(c: &mut Criterion) {
 		let (enc_ng, ct_ng) =
 			Suite::seal_base(&mut prng.unwrap_mut(), &pk_ng, b"info", b"aad", &pt).unwrap();
 
-		rs.seed(SEED).unwrap(); // needed outside of iter(), since seal() draws randomness.
+		rs.seed(&SEED).unwrap(); // needed outside of iter(), since seal() draws randomness.
 		let (enc_rs, ct_rs) = rs
 			.seal(&pk_rs, b"info", b"aad", &pt, None, None, None)
 			.unwrap();
@@ -1467,7 +1499,7 @@ fn bench_context_seal_x25519_chacha(c: &mut Criterion) {
 		rs_types::KdfAlgorithm::HkdfSha256,
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 	let (_enc, mut ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
@@ -1550,7 +1582,7 @@ fn bench_context_open_x25519_chacha(c: &mut Criterion) {
 		// consumes randomness) starts from a fresh cursor. Context::seal
 		// and Context::open are deterministic (nonce = f(seq)), so no PRNG
 		// bytes are drawn inside b.iter().
-		rs.seed(SEED).unwrap();
+		rs.seed(&SEED).unwrap();
 		let (enc_rs, mut ctx_s_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 		let mut ctx_r_rs = rs
 			.setup_receiver(&enc_rs, &sk_rs, b"info", None, None, None)
@@ -1605,9 +1637,9 @@ fn bench_context_open_x25519_chacha(c: &mut Criterion) {
 // =============================================================================
 
 fn bench_export(c: &mut Criterion) {
-	// Note that export in rust-hpke is done via `AeadCtxS::export`,
-	// which takes a label and a mutable output buffer, not a length, making
-	// its export API is incompatible. rust-hpke will be omitted from this benchmark.
+	// rust-hpke's export() writes into a caller-supplied `&mut [u8]` rather
+	// than returning a Vec, so benchmarking it at these lengths would include
+	// a Vec allocation in the timed path and bias the comparison. Omitted.
 	type Suite = ng::Hpke<ng::DhKemX25519HkdfSha256, ng::HkdfSha256, ng::ChaCha20Poly1305>;
 	let mut prng = rand_chacha::ChaCha20Rng::from_seed([0x42u8; 32]);
 	let (_, pk_ng) = ng::DhKemX25519HkdfSha256::generate(&mut prng.unwrap_mut()).unwrap();
@@ -1620,7 +1652,7 @@ fn bench_export(c: &mut Criterion) {
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	let (_enc_rs, ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
 	let mut g = c.benchmark_group("x25519_chacha20_export");
@@ -1681,7 +1713,7 @@ fn bench_roundtrip(c: &mut Criterion) {
 			Suite::open_base(&enc, &sk_ng, b"info", b"aad", &ct).unwrap()
 		})
 	});
-	rs.seed(SEED).unwrap();
+	rs.seed(&SEED).unwrap();
 	g.bench_function("hpke_rs", |b| {
 		b.iter(|| {
 			let (enc, ct) = rs
