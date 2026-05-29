@@ -1742,9 +1742,12 @@ fn bench_context_open_x25519_chacha(c: &mut Criterion) {
 // =============================================================================
 
 fn bench_export(c: &mut Criterion) {
-	// rust-hpke's export() writes into a caller-supplied `&mut [u8]` rather
-	// than returning a Vec, so benchmarking it at these lengths would include
-	// a Vec allocation in the timed path and bias the comparison. Omitted.
+	// API note: hpke-ng and hpke-rs return an allocated Vec per call, so one
+	// small heap allocation is included in their timed paths. rust-hpke writes
+	// into a caller-supplied &mut [u8] with no allocation; a single [u8; 256]
+	// buffer is pre-allocated here and sliced to each output length, so its
+	// timed path is pure HKDF. The difference is intentional and reflects each
+	// library's API design — it is not a measurement artifact.
 	type Suite = ng::Hpke<ng::DhKemX25519HkdfSha256, ng::HkdfSha256, ng::ChaCha20Poly1305>;
 	let mut prng = rand_chacha::ChaCha20Rng::from_seed([0x42u8; 32]);
 	let (_, pk_ng) = ng::DhKemX25519HkdfSha256::generate(&mut prng.unwrap_mut()).unwrap();
@@ -1760,10 +1763,29 @@ fn bench_export(c: &mut Criterion) {
 	rs.seed(&SEED).unwrap();
 	let (_enc_rs, ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
+	// rust-hpke: Note that export() takes a &mut [u8], no allocation.
+	// Pre-allocate once, slice per length inside the loop.
+	let (sk_rh, pk_rh) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
+	let (enc_rh, _) = hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
+		&OpModeS::Base,
+		&pk_rh,
+		b"info",
+		&mut RhChaCha20Rng(&mut prng),
+	)
+	.unwrap();
+	let ctx_rh = hpke::setup_receiver::<RhChaCha20, RhHkdfSha256, RhX25519>(
+		&OpModeR::Base,
+		&sk_rh,
+		&enc_rh,
+		b"info",
+	)
+	.unwrap();
+	let mut rh_export_buf = [0u8; 256]; // covers all EXPORT_LENGTHS (max = 256)
+
 	let mut g = c.benchmark_group("x25519_chacha20_export");
-	// 5 output lengths × 2 libraries (rust-hpke excluded: incompatible API,
-	// see fn comment). export() is one of the cheapest ops in the suite, so
-	// the full 60-sample count is kept for tight CIs; 2s window suffices.
+	// 5 output lengths × 3 libraries. export() is one of the cheapest ops in
+	// the suite, so the full 60-sample count is kept for tight CIs; 2s window
+	// suffices.
 	g.measurement_time(Duration::from_secs(2));
 	g.sample_size(60);
 	for &len in EXPORT_LENGTHS {
@@ -1772,6 +1794,13 @@ fn bench_export(c: &mut Criterion) {
 		});
 		g.bench_with_input(BenchmarkId::new("hpke_rs", len), &len, |b, _| {
 			b.iter(|| ctx_rs.export(b"export-context", black_box(len)).unwrap())
+		});
+		g.bench_with_input(BenchmarkId::new("rust_hpke", len), &len, |b, &len| {
+			b.iter(|| {
+				ctx_rh
+					.export(b"export-context", &mut rh_export_buf[..len])
+					.unwrap()
+			})
 		});
 	}
 	g.finish();
