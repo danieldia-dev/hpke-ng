@@ -110,6 +110,37 @@ fn quick() -> Criterion {
 		.warm_up_time(Duration::from_secs(1))
 }
 
+/// RhChaCha20Rng
+///
+/// rust-hpke v0.14 upgraded to rand_core 0.9's TryRng-based CryptoRng. Our rand_chacha dep
+/// resolves to a different SemVer instance, so ChaCha20Rng does not directly satisfy
+/// `hpke::rand_core::CryptoRng`. This newtype bridges the two: it implements
+/// `hpke::rand_core::{TryRng, TryCryptoRng}` by delegating to ChaCha20Rng's RngCore impl,
+/// giving rust-hpke calls the same deterministic ChaCha20 RNG used everywhere else.
+///
+/// Usage: `&mut RhChaCha20Rng(&mut prng)` wherever rust-hpke needs a csprng.
+struct RhChaCha20Rng<'a>(&'a mut rand_chacha::ChaCha20Rng);
+
+impl hpke::rand_core::TryRng for RhChaCha20Rng<'_> {
+	type Error = core::convert::Infallible;
+
+	fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+		Ok(rand_core::RngCore::next_u32(&mut self.0))
+	}
+
+	fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+		Ok(rand_core::RngCore::next_u64(&mut self.0))
+	}
+
+	fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+		// Delegate to ChaCha20Rng's RngCore::fill_bytes (hpke-ng's rand_core instance).
+		rand_core::RngCore::fill_bytes(&mut self.0, dest);
+		Ok(())
+	}
+}
+
+impl hpke::rand_core::TryCryptoRng for RhChaCha20Rng<'_> {}
+
 // =============================================================================
 //  KEM operations: generate / derive_key_pair / encap / decap
 //  Across X25519, P-256, K256 (all three KEMs hpke-rs/RustCrypto supports).
@@ -144,7 +175,9 @@ fn bench_kem_x25519(c: &mut Criterion) {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
-	g.bench_function("rust_hpke/generate", |b| b.iter(|| RhX25519::gen_keypair()));
+	g.bench_function("rust_hpke/generate", |b| {
+		b.iter(|| RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng)))
+	});
 
 	// derive_key_pair (deterministic, no PRNG) for hpke-ng, hpke-rs, rust-hpke
 	let ikm = [0x99u8; 32];
@@ -196,13 +229,14 @@ fn bench_kem_x25519(c: &mut Criterion) {
 
 	// rust-hpke encap via `setup_sender`
 	{
-		let (_, pk) = RhX25519::gen_keypair();
+		let (_, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 		g.bench_function("rust_hpke/encap_via_setup_sender", |b| {
 			b.iter(|| {
-				hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(
+				hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
 					&OpModeS::Base,
 					black_box(&pk),
 					b"",
+					&mut RhChaCha20Rng(&mut prng),
 				)
 				.unwrap()
 			})
@@ -238,10 +272,14 @@ fn bench_kem_x25519(c: &mut Criterion) {
 
 	// rust-hpke decap via `setup_receiver`
 	{
-		let (sk, pk) = RhX25519::gen_keypair();
-		let (enc, _) =
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(&OpModeS::Base, &pk, b"")
-				.unwrap();
+		let (sk, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
+		let (enc, _) = hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
+			&OpModeS::Base,
+			&pk,
+			b"",
+			&mut RhChaCha20Rng(&mut prng),
+		)
+		.unwrap();
 		g.bench_function("rust_hpke/decap_via_setup_receiver", |b| {
 			b.iter(|| {
 				hpke::setup_receiver::<RhChaCha20, RhHkdfSha256, RhX25519>(
@@ -276,7 +314,9 @@ fn bench_kem_p256(c: &mut Criterion) {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
-	g.bench_function("rust_hpke/generate", |b| b.iter(|| RhP256::gen_keypair()));
+	g.bench_function("rust_hpke/generate", |b| {
+		b.iter(|| RhP256::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng)))
+	});
 
 	let ikm = [0x99u8; 32];
 	g.bench_function("hpke_ng/derive_key_pair", |b| {
@@ -322,13 +362,14 @@ fn bench_kem_p256(c: &mut Criterion) {
 		});
 	}
 	{
-		let (_, pk) = RhP256::gen_keypair();
+		let (_, pk) = RhP256::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 		g.bench_function("rust_hpke/encap_via_setup_sender", |b| {
 			b.iter(|| {
-				hpke::setup_sender::<RhAes128, RhHkdfSha256, RhP256>(
+				hpke::setup_sender_with_rng::<RhAes128, RhHkdfSha256, RhP256>(
 					&OpModeS::Base,
 					black_box(&pk),
 					b"",
+					&mut RhChaCha20Rng(&mut prng),
 				)
 				.unwrap()
 			})
@@ -360,9 +401,14 @@ fn bench_kem_p256(c: &mut Criterion) {
 		});
 	}
 	{
-		let (sk, pk) = RhP256::gen_keypair();
-		let (enc, _) =
-			hpke::setup_sender::<RhAes128, RhHkdfSha256, RhP256>(&OpModeS::Base, &pk, b"").unwrap();
+		let (sk, pk) = RhP256::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
+		let (enc, _) = hpke::setup_sender_with_rng::<RhAes128, RhHkdfSha256, RhP256>(
+			&OpModeS::Base,
+			&pk,
+			b"",
+			&mut RhChaCha20Rng(&mut prng),
+		)
+		.unwrap();
 		g.bench_function("rust_hpke/decap_via_setup_receiver", |b| {
 			b.iter(|| {
 				hpke::setup_receiver::<RhAes128, RhHkdfSha256, RhP256>(
@@ -456,7 +502,9 @@ fn bench_kem_xwing(c: &mut Criterion) {
 			b.iter(|| rs.generate_key_pair().unwrap())
 		});
 	}
-	g.bench_function("rust_hpke/generate", |b| b.iter(|| RhXWing::gen_keypair()));
+	g.bench_function("rust_hpke/generate", |b| {
+		b.iter(|| RhXWing::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng)))
+	});
 
 	let ikm = [0x99u8; 32];
 	g.bench_function("hpke_ng/derive_key_pair", |b| {
@@ -500,13 +548,14 @@ fn bench_kem_xwing(c: &mut Criterion) {
 		});
 	}
 	{
-		let (_, pk) = RhXWing::gen_keypair();
+		let (_, pk) = RhXWing::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 		g.bench_function("rust_hpke/encap_via_setup_sender", |b| {
 			b.iter(|| {
-				hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhXWing>(
+				hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhXWing>(
 					&OpModeS::Base,
 					black_box(&pk),
 					b"",
+					&mut RhChaCha20Rng(&mut prng),
 				)
 				.unwrap()
 			})
@@ -538,10 +587,14 @@ fn bench_kem_xwing(c: &mut Criterion) {
 		});
 	}
 	{
-		let (sk, pk) = RhXWing::gen_keypair();
-		let (enc, _) =
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhXWing>(&OpModeS::Base, &pk, b"")
-				.unwrap();
+		let (sk, pk) = RhXWing::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
+		let (enc, _) = hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhXWing>(
+			&OpModeS::Base,
+			&pk,
+			b"",
+			&mut RhChaCha20Rng(&mut prng),
+		)
+		.unwrap();
 		g.bench_function("rust_hpke/decap_via_setup_receiver", |b| {
 			b.iter(|| {
 				hpke::setup_receiver::<RhChaCha20, RhHkdfSha256, RhXWing>(
@@ -761,7 +814,7 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 	rs.seed(&SEED).unwrap();
 	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
-	let (_, pk) = RhX25519::gen_keypair();
+	let (_, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_chacha20/setup_sender_base");
 
@@ -779,10 +832,11 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 	});
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(
+			hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
 				&OpModeS::Base,
 				black_box(&pk),
 				b"info",
+				&mut RhChaCha20Rng(&mut prng),
 			)
 			.unwrap()
 		})
@@ -802,10 +856,14 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 		})
 	});
 	{
-		let (sk, pk) = RhX25519::gen_keypair();
-		let (enc, _) =
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(&OpModeS::Base, &pk, b"info")
-				.unwrap();
+		let (sk, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
+		let (enc, _) = hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
+			&OpModeS::Base,
+			&pk,
+			b"info",
+			&mut RhChaCha20Rng(&mut prng),
+		)
+		.unwrap();
 		g.bench_function("rust_hpke", |b| {
 			b.iter(|| {
 				hpke::setup_receiver::<RhChaCha20, RhHkdfSha256, RhX25519>(
@@ -830,7 +888,7 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 		rs_types::AeadAlgorithm::ChaCha20Poly1305,
 	);
 	let (_sk_psk_rs, pk_psk_rs) = rs_psk.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
-	let (_, pk_psk_rh) = RhX25519::gen_keypair();
+	let (_, pk_psk_rh) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 	let mut g = c.benchmark_group("x25519_chacha20/setup_sender_psk");
 	rs_psk.seed(&SEED).unwrap();
 	g.bench_function("hpke_ng", |b| {
@@ -860,10 +918,11 @@ fn bench_setup_x25519_chacha(c: &mut Criterion) {
 	});
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(
+			hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
 				&OpModeS::Psk(PskBundle::new(&psk, psk_id).unwrap()),
 				black_box(&pk_psk_rh),
 				b"info",
+				&mut RhChaCha20Rng(&mut prng),
 			)
 			.unwrap()
 		})
@@ -884,7 +943,7 @@ fn bench_setup_x25519_aes128(c: &mut Criterion) {
 	);
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (_, pk) = RhX25519::gen_keypair();
+	let (_, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_aes128/setup_sender_base");
 	g.bench_function("hpke_ng", |b| {
@@ -901,10 +960,11 @@ fn bench_setup_x25519_aes128(c: &mut Criterion) {
 	});
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			hpke::setup_sender::<RhAes128, RhHkdfSha256, RhX25519>(
+			hpke::setup_sender_with_rng::<RhAes128, RhHkdfSha256, RhX25519>(
 				&OpModeS::Base,
 				black_box(&pk),
 				b"info",
+				&mut RhChaCha20Rng(&mut prng),
 			)
 			.unwrap()
 		})
@@ -925,7 +985,7 @@ fn bench_setup_x25519_aes256(c: &mut Criterion) {
 	);
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (_, pk) = RhX25519::gen_keypair();
+	let (_, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_aes256/setup_sender_base");
 	g.bench_function("hpke_ng", |b| {
@@ -942,10 +1002,11 @@ fn bench_setup_x25519_aes256(c: &mut Criterion) {
 	});
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			hpke::setup_sender::<RhAes256, RhHkdfSha256, RhX25519>(
+			hpke::setup_sender_with_rng::<RhAes256, RhHkdfSha256, RhX25519>(
 				&OpModeS::Base,
 				black_box(&pk),
 				b"info",
+				&mut RhChaCha20Rng(&mut prng),
 			)
 			.unwrap()
 		})
@@ -966,7 +1027,7 @@ fn bench_setup_p256_aes128(c: &mut Criterion) {
 	);
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (_, pk) = RhP256::gen_keypair();
+	let (_, pk) = RhP256::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("p256_aes128/setup_sender_base");
 	g.bench_function("hpke_ng", |b| {
@@ -983,10 +1044,11 @@ fn bench_setup_p256_aes128(c: &mut Criterion) {
 	});
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			hpke::setup_sender::<RhAes128, RhHkdfSha256, RhP256>(
+			hpke::setup_sender_with_rng::<RhAes128, RhHkdfSha256, RhP256>(
 				&OpModeS::Base,
 				black_box(&pk),
 				b"info",
+				&mut RhChaCha20Rng(&mut prng),
 			)
 			.unwrap()
 		})
@@ -1007,7 +1069,7 @@ fn bench_setup_p256_aes256(c: &mut Criterion) {
 	);
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (_, pk) = RhP256::gen_keypair();
+	let (_, pk) = RhP256::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("p256_aes256/setup_sender_base");
 	g.bench_function("hpke_ng", |b| {
@@ -1024,10 +1086,11 @@ fn bench_setup_p256_aes256(c: &mut Criterion) {
 	});
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			hpke::setup_sender::<RhAes256, RhHkdfSha256, RhP256>(
+			hpke::setup_sender_with_rng::<RhAes256, RhHkdfSha256, RhP256>(
 				&OpModeS::Base,
 				black_box(&pk),
 				b"info",
+				&mut RhChaCha20Rng(&mut prng),
 			)
 			.unwrap()
 		})
@@ -1081,10 +1144,14 @@ fn bench_setup_xwing_chacha(c: &mut Criterion) {
 	rs.seed(&SEED).unwrap();
 	let (enc_rs, _ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
-	let (sk_rh, pk_rh) = RhXWing::gen_keypair();
-	let (enc_rh, _) =
-		hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhXWing>(&OpModeS::Base, &pk_rh, b"info")
-			.unwrap();
+	let (sk_rh, pk_rh) = RhXWing::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
+	let (enc_rh, _) = hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhXWing>(
+		&OpModeS::Base,
+		&pk_rh,
+		b"info",
+		&mut RhChaCha20Rng(&mut prng),
+	)
+	.unwrap();
 
 	let mut g = c.benchmark_group("xwing_chacha20/setup_sender_base");
 	g.bench_function("hpke_ng", |b| {
@@ -1102,10 +1169,11 @@ fn bench_setup_xwing_chacha(c: &mut Criterion) {
 	// same x-wing crate and share KEM_ID 0x647a; shared secrets are fully interoperable.
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhXWing>(
+			hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhXWing>(
 				&OpModeS::Base,
 				black_box(&pk_rh),
 				b"info",
+				&mut RhChaCha20Rng(&mut prng),
 			)
 			.unwrap()
 		})
@@ -1247,7 +1315,7 @@ fn bench_seal_x25519_chacha_payload_sweep(c: &mut Criterion) {
 	);
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (_, pk) = RhX25519::gen_keypair();
+	let (_, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_chacha20_seal_sweep");
 	// 8 payload sizes × 3 libraries = 24 timed benchmarks in this group.
@@ -1281,10 +1349,12 @@ fn bench_seal_x25519_chacha_payload_sweep(c: &mut Criterion) {
 		});
 		g.bench_with_input(BenchmarkId::new("rust_hpke", size), &size, |b, _| {
 			b.iter(|| {
-				let (_enc, mut ctx) = hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(
-					&OpModeS::Base,
-					&pk,
-					b"info",
+				let (_enc, mut ctx) = hpke::setup_sender_with_rng::<
+					RhChaCha20,
+					RhHkdfSha256,
+					RhX25519,
+				>(
+					&OpModeS::Base, &pk, b"info", &mut RhChaCha20Rng(&mut prng)
 				)
 				.unwrap();
 				ctx.seal(black_box(&pt), b"aad").unwrap()
@@ -1308,7 +1378,7 @@ fn bench_seal_x25519_aes128_payload_sweep(c: &mut Criterion) {
 	);
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (_, pk) = RhX25519::gen_keypair();
+	let (_, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_aes128_seal_sweep");
 	// Reduced 6-size sweep (drops 16 B and 256 KiB extremes), 3 libraries.
@@ -1340,12 +1410,14 @@ fn bench_seal_x25519_aes128_payload_sweep(c: &mut Criterion) {
 		});
 		g.bench_with_input(BenchmarkId::new("rust_hpke", size), &size, |b, _| {
 			b.iter(|| {
-				let (_enc, mut ctx) = hpke::setup_sender::<RhAes128, RhHkdfSha256, RhX25519>(
-					&OpModeS::Base,
-					&pk,
-					b"info",
-				)
-				.unwrap();
+				let (_enc, mut ctx) =
+					hpke::setup_sender_with_rng::<RhAes128, RhHkdfSha256, RhX25519>(
+						&OpModeS::Base,
+						&pk,
+						b"info",
+						&mut RhChaCha20Rng(&mut prng),
+					)
+					.unwrap();
 				ctx.seal(black_box(&pt), b"aad").unwrap()
 			})
 		});
@@ -1371,7 +1443,7 @@ fn bench_open_x25519_chacha_payload_sweep(c: &mut Criterion) {
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (sk, pk) = RhX25519::gen_keypair();
+	let (sk, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_chacha20_open_sweep");
 	// Mirrors the chacha seal sweep budget (40 / 2s) so seal and open numbers
@@ -1389,9 +1461,13 @@ fn bench_open_x25519_chacha_payload_sweep(c: &mut Criterion) {
 			.seal(&pk_rs, b"info", b"aad", &pt, None, None, None)
 			.unwrap();
 
-		let (enc, mut ctx_s) =
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(&OpModeS::Base, &pk, b"info")
-				.unwrap();
+		let (enc, mut ctx_s) = hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
+			&OpModeS::Base,
+			&pk,
+			b"info",
+			&mut RhChaCha20Rng(&mut prng),
+		)
+		.unwrap();
 		let ct = ctx_s.seal(&pt, b"aad").unwrap();
 
 		g.throughput(Throughput::Bytes(size as u64));
@@ -1445,7 +1521,7 @@ fn bench_open_x25519_aes128_payload_sweep(c: &mut Criterion) {
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (sk, pk) = RhX25519::gen_keypair();
+	let (sk, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_aes128_open_sweep");
 	// Matches the aes128 seal sweep and the chacha open sweep (40 / 2s):
@@ -1463,9 +1539,13 @@ fn bench_open_x25519_aes128_payload_sweep(c: &mut Criterion) {
 			.seal(&pk_rs, b"info", b"aad", &pt, None, None, None)
 			.unwrap();
 
-		let (enc, mut ctx_s) =
-			hpke::setup_sender::<RhAes128, RhHkdfSha256, RhX25519>(&OpModeS::Base, &pk, b"info")
-				.unwrap();
+		let (enc, mut ctx_s) = hpke::setup_sender_with_rng::<RhAes128, RhHkdfSha256, RhX25519>(
+			&OpModeS::Base,
+			&pk,
+			b"info",
+			&mut RhChaCha20Rng(&mut prng),
+		)
+		.unwrap();
 		let ct = ctx_s.seal(&pt, b"aad").unwrap();
 
 		g.throughput(Throughput::Bytes(size as u64));
@@ -1527,10 +1607,14 @@ fn bench_context_seal_x25519_chacha(c: &mut Criterion) {
 	let (_, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 	let (_enc, mut ctx_rs) = rs.setup_sender(&pk_rs, b"info", None, None, None).unwrap();
 
-	let (_, pk) = RhX25519::gen_keypair();
-	let (_, mut ctx_rh) =
-		hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(&OpModeS::Base, &pk, b"info")
-			.unwrap();
+	let (_, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
+	let (_, mut ctx_rh) = hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
+		&OpModeS::Base,
+		&pk,
+		b"info",
+		&mut RhChaCha20Rng(&mut prng),
+	)
+	.unwrap();
 
 	let mut g = c.benchmark_group("x25519_chacha20_context_seal");
 	// Post-setup hot path: only 4 sizes × 3 libraries, and each iteration is
@@ -1577,7 +1661,7 @@ fn bench_context_open_x25519_chacha(c: &mut Criterion) {
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (sk, pk) = RhX25519::gen_keypair();
+	let (sk, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let mut g = c.benchmark_group("x25519_chacha20_context_open");
 	// Same 50 / 2s budget as context_seal for symmetry. Both sender and
@@ -1609,9 +1693,14 @@ fn bench_context_open_x25519_chacha(c: &mut Criterion) {
 			.unwrap();
 
 		// Setup synchronized contexts for rust_hpke
-		let (enc_rh, mut ctx_s_rh) =
-			hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(&OpModeS::Base, &pk, b"info")
-				.unwrap();
+		let (enc_rh, mut ctx_s_rh) = hpke::setup_sender_with_rng::<
+			RhChaCha20,
+			RhHkdfSha256,
+			RhX25519,
+		>(
+			&OpModeS::Base, &pk, b"info", &mut RhChaCha20Rng(&mut prng)
+		)
+		.unwrap();
 		let mut ctx_r_rh = hpke::setup_receiver::<RhChaCha20, RhHkdfSha256, RhX25519>(
 			&OpModeR::Base,
 			&sk,
@@ -1705,7 +1794,7 @@ fn bench_roundtrip(c: &mut Criterion) {
 	);
 	let (sk_rs, pk_rs) = rs.derive_key_pair(&[0x42u8; 32]).unwrap().into_keys();
 
-	let (sk, pk) = RhX25519::gen_keypair();
+	let (sk, pk) = RhX25519::gen_keypair_with_rng(&mut RhChaCha20Rng(&mut prng));
 
 	let pt = vec![0xAAu8; 1024];
 
@@ -1743,12 +1832,14 @@ fn bench_roundtrip(c: &mut Criterion) {
 	});
 	g.bench_function("rust_hpke", |b| {
 		b.iter(|| {
-			let (enc, mut ctx_s) = hpke::setup_sender::<RhChaCha20, RhHkdfSha256, RhX25519>(
-				&OpModeS::Base,
-				&pk,
-				b"info",
-			)
-			.unwrap();
+			let (enc, mut ctx_s) =
+				hpke::setup_sender_with_rng::<RhChaCha20, RhHkdfSha256, RhX25519>(
+					&OpModeS::Base,
+					&pk,
+					b"info",
+					&mut RhChaCha20Rng(&mut prng),
+				)
+				.unwrap();
 			let ct = ctx_s.seal(black_box(&pt), b"aad").unwrap();
 			let mut ctx_r = hpke::setup_receiver::<RhChaCha20, RhHkdfSha256, RhX25519>(
 				&OpModeR::Base,
