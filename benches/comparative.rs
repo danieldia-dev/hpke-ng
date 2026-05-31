@@ -2,8 +2,7 @@
 //!
 //! Run with:
 //! ```
-//! RUSTFLAGS="-C target-cpu=native" \
-//!   cargo bench --features comparative --bench comparative
+//! RUSTFLAGS="-C target-cpu=native" cargo bench --features comparative --bench comparative
 //! ```
 //!
 //! ## Coverage
