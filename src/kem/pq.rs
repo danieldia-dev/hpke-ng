@@ -176,9 +176,12 @@ impl Kem for XWingDraft06 {
 		let mut compat = RngCompat10(rng);
 		// Use the cached parsed `EncapsulationKey` directly — no per-call
 		// `try_from` over the 1216-byte wire form.
-		let (ct, ss) = pk_r.parsed.encapsulate_with_rng(&mut compat);
+		let (ct, mut ss) = pk_r.parsed.encapsulate_with_rng(&mut compat);
 		let mut ss_bytes = [0u8; 32];
 		ss_bytes.copy_from_slice(ss.as_ref());
+		// Scrub the upstream shared-secret array; it is a plain `Array<u8, 32>`
+		// with no zeroize-on-drop. The wrapper owns the only surviving copy.
+		ss.zeroize();
 		Ok((XWingSharedSecret(ss_bytes), XWingEncappedKey(ct.to_vec())))
 	}
 
@@ -194,11 +197,13 @@ impl Kem for XWingDraft06 {
 		// is a use-after-zeroize at the call site, so reject explicitly
 		// rather than panicking.
 		let dk = sk_r.dk.as_ref().ok_or(HpkeError::DecapError)?;
-		let ss = dk
+		let mut ss = dk
 			.decapsulate_slice(enc.0.as_slice())
 			.map_err(|_| HpkeError::InvalidEncappedKey)?;
 		let mut ss_bytes = [0u8; 32];
 		ss_bytes.copy_from_slice(ss.as_ref());
+		// Scrub the upstream shared-secret array (see `encap`).
+		ss.zeroize();
 		Ok(XWingSharedSecret(ss_bytes))
 	}
 
@@ -392,8 +397,12 @@ macro_rules! ml_kem_variant {
 				let mut compat = RngCompat10(rng);
 				// Cached parsed `EncapsulationKey` — no per-call `try_into`
 				// + `<$ek>::new` over the 1184/1568-byte wire form.
-				let (ct, ss) = pk_r.parsed.encapsulate_with_rng(&mut compat);
-				Ok((MlKemSharedSecret(ss.to_vec()), $enc_wrap(ct.to_vec())))
+				let (ct, mut ss) = pk_r.parsed.encapsulate_with_rng(&mut compat);
+				let out = MlKemSharedSecret(ss.to_vec());
+				// Scrub the upstream shared-secret array; `MlKemSharedSecret`
+				// owns the only surviving copy.
+				ss.zeroize();
+				Ok((out, $enc_wrap(ct.to_vec())))
 			}
 
 			fn decap(
@@ -406,8 +415,11 @@ macro_rules! ml_kem_variant {
 					.as_slice()
 					.try_into()
 					.map_err(|_| HpkeError::InvalidEncappedKey)?;
-				let ss = sk_r.dk.decapsulate(&ct);
-				Ok(MlKemSharedSecret(ss.to_vec()))
+				let mut ss = sk_r.dk.decapsulate(&ct);
+				let out = MlKemSharedSecret(ss.to_vec());
+				// Scrub the upstream shared-secret array (see `encap`).
+				ss.zeroize();
+				Ok(out)
 			}
 
 			fn pk_from_bytes(b: &[u8]) -> Result<Self::PublicKey, HpkeError> {

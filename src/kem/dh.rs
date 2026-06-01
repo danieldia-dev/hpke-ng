@@ -788,8 +788,11 @@ fn x448_scalar_mult_base(sk: &[u8; 56]) -> [u8; 56] {
 		EdwardsScalar, MontgomeryPoint,
 		elliptic_curve::{bigint::U448, scalar::FromUintUnchecked as _},
 	};
-	let scalar = EdwardsScalar::from_uint_unchecked(U448::from_le_slice(sk));
+	let mut scalar = EdwardsScalar::from_uint_unchecked(U448::from_le_slice(sk));
 	let result = &MontgomeryPoint::GENERATOR * &scalar;
+	// Scrub the secret scalar copy: `ed448-goldilocks` scalars carry no
+	// zeroize-on-drop. `result` here is the public key, not secret.
+	scalar.zeroize();
 	*result.as_bytes()
 }
 
@@ -801,10 +804,16 @@ fn x448_scalar_mult(sk: &[u8; 56], pk: &[u8; 56]) -> [u8; 56] {
 		EdwardsScalar, MontgomeryPoint,
 		elliptic_curve::{bigint::U448, scalar::FromUintUnchecked as _},
 	};
-	let scalar = EdwardsScalar::from_uint_unchecked(U448::from_le_slice(sk));
+	let mut scalar = EdwardsScalar::from_uint_unchecked(U448::from_le_slice(sk));
 	let point = MontgomeryPoint(*pk);
-	let result = &point * &scalar;
-	*result.as_bytes()
+	let mut result = &point * &scalar;
+	let out = *result.as_bytes();
+	// Scrub the secret scalar and the DH shared-secret point. Neither
+	// `ed448-goldilocks` type zeroizes on drop, unlike the dalek/ecdh
+	// `SharedSecret` types the other DH curves route through.
+	scalar.zeroize();
+	result.zeroize();
+	out
 }
 
 /// X448 group, used by `DHKEM(X448, HKDF-SHA512)` (ID `0x0021`).
@@ -858,7 +867,10 @@ impl DiffieHellman for X448 {
 
 	fn dh(sk: &Self::PrivateKey, pk: &Self::PublicKey) -> Result<Vec<u8>, HpkeError> {
 		use subtle::ConstantTimeEq;
-		let shared = x448_scalar_mult(&sk.0, &pk.0);
+		// Hold the raw DH output in `Zeroizing` so the stack copy is scrubbed:
+		// the hand-rolled X448 ladder returns a plain array, unlike the
+		// dalek/ecdh `SharedSecret` types used by the other curves.
+		let shared = Zeroizing::new(x448_scalar_mult(&sk.0, &pk.0));
 		// RFC 9180 §7.1.4: constant-time reject of the all-zeros DH output.
 		let zero = [0u8; 56];
 		if shared.ct_eq(&zero).into() {
