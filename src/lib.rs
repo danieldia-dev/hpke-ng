@@ -17,7 +17,7 @@
 //! assert_eq!(pt, b"hello");
 //! ```
 //!
-//! See the [Readme](https://github.com/symbolicsoft/hpke-ng) for design notes
+//! See the [README](https://github.com/symbolicsoft/hpke-ng) for design notes
 //! and the constant-time disclosure table.
 
 #![cfg_attr(not(feature = "std"), no_std)]
