@@ -237,10 +237,10 @@ pub fn key_schedule_psk_free<M: PskFreeMode, K: Kem, F: Kdf, A: Aead>(
 	key_schedule_psk_free_impl::<M, K, F, A>(shared_secret, info)
 }
 
-/// Key schedule for PSK-bearing HPKE modes (PSK and AuthPSK, RFC 9180 §5.1.2 and §5.1.4).
+/// Key schedule for PSK-bearing HPKE modes (PSK and `AuthPSK`, RFC 9180 §5.1.2 and §5.1.4).
 /// Validates that `psk` and `psk_id` are consistent and well-formed before deriving
 /// the context. The mode tag `M: PskMode` enforces at compile time that only PSK
-/// and AuthPSK modes reach this path.
+/// and `AuthPSK` modes reach this path.
 fn key_schedule_psk_impl<M: PskMode, K: Kem, F: Kdf, A: Aead>(
 	shared_secret: &[u8],
 	info: &[u8],
