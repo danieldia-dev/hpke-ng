@@ -212,8 +212,13 @@ fn key_schedule_psk_free_impl<M: PskFreeMode, K: Kem, F: Kdf, A: Aead>(
 
 	let secret = Zeroizing::new(labeled_extract::<F>(shared_secret, &suite, b"secret", &[]));
 	let key = labeled_expand_pieces::<F>(&secret, &suite, b"key", &ks_pieces, A::KEY_LEN)?;
-	let base_nonce =
-		labeled_expand_pieces::<F>(&secret, &suite, b"base_nonce", &ks_pieces, A::NONCE_LEN)?;
+	let base_nonce = Zeroizing::new(labeled_expand_pieces::<F>(
+		&secret,
+		&suite,
+		b"base_nonce",
+		&ks_pieces,
+		A::NONCE_LEN,
+	)?);
 	let exporter_secret =
 		labeled_expand_pieces::<F>(&secret, &suite, b"exp", &ks_pieces, F::HASH_LEN)?;
 	Context::new(key, base_nonce, exporter_secret)
@@ -259,8 +264,13 @@ fn key_schedule_psk_impl<M: PskMode, K: Kem, F: Kdf, A: Aead>(
 
 	let secret = Zeroizing::new(labeled_extract::<F>(shared_secret, &suite, b"secret", psk));
 	let key = labeled_expand_pieces::<F>(&secret, &suite, b"key", &ks_pieces, A::KEY_LEN)?;
-	let base_nonce =
-		labeled_expand_pieces::<F>(&secret, &suite, b"base_nonce", &ks_pieces, A::NONCE_LEN)?;
+	let base_nonce = Zeroizing::new(labeled_expand_pieces::<F>(
+		&secret,
+		&suite,
+		b"base_nonce",
+		&ks_pieces,
+		A::NONCE_LEN,
+	)?);
 	let exporter_secret =
 		labeled_expand_pieces::<F>(&secret, &suite, b"exp", &ks_pieces, F::HASH_LEN)?;
 
