@@ -109,7 +109,7 @@ where
 	);
 
 	let ikm_e = hex_decode(&v.ikmE);
-	let (_sk_e, pk_e) = K::derive_key_pair(&ikm_e).expect("derive E");
+	let (_, pk_e) = K::derive_key_pair(&ikm_e).expect("derive E");
 	assert_eq!(
 		<K as Kem>::pk_to_bytes(&pk_e),
 		hex_decode(&v.pkEm),
@@ -121,9 +121,30 @@ where
 	let shared_secret = hex_decode(&v.shared_secret);
 
 	// 1. Direct key-schedule comparison.
-	let direct_ctx =
-		hpke_ng::__test_only::key_schedule::<K, F, A>(v.mode, &shared_secret, &info, &psk, &psk_id)
-			.expect("key_schedule");
+	let direct_ctx = match v.mode {
+		0 => hpke_ng::__test_only::key_schedule_psk_free::<hpke_ng::BaseModeTag, K, F, A>(
+			&shared_secret,
+			&info,
+		),
+		1 => hpke_ng::__test_only::key_schedule_psk::<hpke_ng::PskModeTag, K, F, A>(
+			&shared_secret,
+			&info,
+			&psk,
+			&psk_id,
+		),
+		2 => hpke_ng::__test_only::key_schedule_psk_free::<hpke_ng::AuthModeTag, K, F, A>(
+			&shared_secret,
+			&info,
+		),
+		3 => hpke_ng::__test_only::key_schedule_psk::<hpke_ng::AuthPskModeTag, K, F, A>(
+			&shared_secret,
+			&info,
+			&psk,
+			&psk_id,
+		),
+		m => panic!("unknown mode {m}"),
+	}
+	.expect("key_schedule");
 	assert_eq!(direct_ctx.key(), hex_decode(&v.key), "key mismatch");
 	assert_eq!(
 		direct_ctx.nonce(),
