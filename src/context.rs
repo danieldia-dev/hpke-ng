@@ -31,6 +31,10 @@ pub struct Context<K: Kem, F: Kdf, A: Aead> {
 	_kfa: PhantomData<(K, F, A)>,
 }
 
+const SEQ_LEN: usize = 8;
+
+const MAX_NONCE_LEN: usize = 12;
+
 /// Compile-time verification that an AEAD's nonce length fits the fixed buffer
 /// in [`Context::compute_nonce`] and accommodates the 64-bit sequence number.
 /// Evaluated lazily — only AEADs whose seal/open paths are instantiated must
@@ -40,8 +44,14 @@ struct AssertNonceRange<A: Aead>(PhantomData<A>);
 
 impl<A: Aead> AssertNonceRange<A> {
 	const CHECK: () = {
-		assert!(A::NONCE_LEN >= 8, "AEAD::NONCE_LEN must be >= 8");
-		assert!(A::NONCE_LEN <= 12, "AEAD::NONCE_LEN must be <= 12");
+		assert!(
+			A::NONCE_LEN >= SEQ_LEN,
+			"AEAD::NONCE_LEN must be >= the sequence-counter width"
+		);
+		assert!(
+			A::NONCE_LEN <= MAX_NONCE_LEN,
+			"AEAD::NONCE_LEN must fit the nonce buffer"
+		);
 	};
 }
 
@@ -83,17 +93,17 @@ impl<K: Kem, F: Kdf, A: Aead> Context<K, F, A> {
 	}
 
 	/// `Context.ComputeNonce(seq)` (RFC 9180 §5.2).
-	fn compute_nonce(&self) -> [u8; 12] {
-		// Force compile-time evaluation of the `8 <= NONCE_LEN <= 12` bound.
+	fn compute_nonce(&self) -> [u8; MAX_NONCE_LEN] {
+		// Force compile-time evaluation of the `SEQ_LEN <= NONCE_LEN <= MAX_NONCE_LEN` bound.
 		let () = AssertNonceRange::<A>::CHECK;
-		let mut nonce = [0u8; 12];
 		let len = A::NONCE_LEN;
+		let mut nonce = [0u8; MAX_NONCE_LEN];
 		nonce[..len].copy_from_slice(&self.base_nonce[..len]);
+		// XOR the big-endian sequence counter into the trailing `SEQ_LEN`
+		// bytes of the (≤ `MAX_NONCE_LEN`-byte) nonce.
 		let seq_be = self.seq.to_be_bytes();
-		// XOR the 8-byte big-endian sequence counter into the trailing
-		// 8 bytes of the (≤ 12-byte) nonce.
-		for i in 0..8 {
-			nonce[len - 8 + i] ^= seq_be[i];
+		for (dst, &b) in nonce[len - SEQ_LEN..len].iter_mut().zip(&seq_be) {
+			*dst ^= b;
 		}
 		nonce
 	}
