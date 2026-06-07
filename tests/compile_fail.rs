@@ -24,4 +24,6 @@ fn compile_fail() {
 	t.compile_fail("tests/compile_fail/psk_rejects_base_tag.rs");
 	// `key_schedule_psk` requires M: PskMode, so AuthModeTag must be rejected
 	t.compile_fail("tests/compile_fail/psk_rejects_auth_tag.rs");
+	// Cannot implement the `sealed` supertrait on an external type
+	t.compile_fail("tests/compile_fail/external_impl_sealed.rs");
 }
