@@ -16,10 +16,12 @@ fn compile_fail() {
 	t.compile_fail("tests/compile_fail/receiver_cannot_seal.rs");
 	// A `SenderContext` (from `setup_sender_*`) must NOT expose `open`
 	t.compile_fail("tests/compile_fail/sender_cannot_open.rs");
-	// `key_schedule_psk_free` requires M: PskFreeMode
+	// `key_schedule_psk_free` requires M: PskFreeMode, so PskModeTag must be rejected
 	t.compile_fail("tests/compile_fail/psk_free_rejects_psk_tag.rs");
-	// `key_schedule_psk_free` requires M: PskFreeMode
+	// `key_schedule_psk_free` requires M: PskFreeMode, so AuthPskModeTag must be rejected
 	t.compile_fail("tests/compile_fail/psk_free_rejects_auth_psk_tag.rs");
-	// `key_schedule_psk` requires M: PskMode
+	// `key_schedule_psk` requires M: PskMode, so BaseModeTag must be rejected
 	t.compile_fail("tests/compile_fail/psk_rejects_base_tag.rs");
+	// `key_schedule_psk` requires M: PskMode, so AuthModeTag must be rejected
+	t.compile_fail("tests/compile_fail/psk_rejects_auth_tag.rs");
 }
