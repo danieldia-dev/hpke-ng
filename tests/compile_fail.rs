@@ -18,4 +18,6 @@ fn compile_fail() {
 	t.compile_fail("tests/compile_fail/sender_cannot_open.rs");
 	// `key_schedule_psk_free` requires M: PskFreeMode
 	t.compile_fail("tests/compile_fail/psk_free_rejects_psk_tag.rs");
+	// `key_schedule_psk_free` requires M: PskFreeMode
+	t.compile_fail("tests/compile_fail/psk_free_rejects_auth_psk_tag.rs");
 }
