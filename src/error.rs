@@ -83,9 +83,7 @@ impl fmt::Display for HpkeError {
 			Self::ExportLengthExceeded => "requested length exceeds HKDF-Expand maximum",
 			Self::MessageLimitReached => "AEAD message limit reached",
 			Self::DeriveKeyPairError => "DeriveKeyPair rejection sampling exhausted",
-			Self::InvalidKeyMaterial => {
-				"Input keying material supplied to DeriveKeyPair has the wrong length"
-			}
+			Self::InvalidKeyMaterial => "input keying material has incorrect length",
 		};
 		f.write_str(s)
 	}
@@ -107,7 +105,7 @@ mod tests {
 		);
 		assert_eq!(
 			format!("{}", HpkeError::InvalidKeyMaterial),
-			"Input keying material supplied to DeriveKeyPair has the wrong length"
+			"input keying material has incorrect length"
 		);
 	}
 
