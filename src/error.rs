@@ -56,6 +56,13 @@ pub enum HpkeError {
 	/// (RFC 9180 §7.1.3). With high probability this only occurs when the
 	/// IKM has insufficient entropy.
 	DeriveKeyPairError,
+	/// The input keying material supplied to `DeriveKeyPair` has the wrong length.
+	///
+	/// For ML-KEM-768 and ML-KEM-1024, `derive_key_pair` requires exactly
+	/// 64 bytes of IKM representing the `(d, z)` seed as specified in
+	/// draft-connolly-cfrg-hpke-mlkem §3.2.
+	/// Passing any other length returns this error.
+	InvalidKeyMaterial,
 }
 
 impl fmt::Display for HpkeError {
@@ -76,6 +83,7 @@ impl fmt::Display for HpkeError {
 			Self::ExportLengthExceeded => "requested length exceeds HKDF-Expand maximum",
 			Self::MessageLimitReached => "AEAD message limit reached",
 			Self::DeriveKeyPairError => "DeriveKeyPair rejection sampling exhausted",
+			Self::InvalidKeyMaterial => "input keying material has incorrect length",
 		};
 		f.write_str(s)
 	}
@@ -94,6 +102,10 @@ mod tests {
 		assert_eq!(
 			format!("{}", HpkeError::InsecurePsk),
 			"PSK shorter than 32 bytes"
+		);
+		assert_eq!(
+			format!("{}", HpkeError::InvalidKeyMaterial),
+			"input keying material has incorrect length"
 		);
 	}
 
