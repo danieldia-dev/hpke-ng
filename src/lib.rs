@@ -61,7 +61,7 @@ pub use kem::{
 };
 
 #[cfg(feature = "pq")]
-pub use kem::pq::{MlKem768, MlKem1024, XWingDraft06};
+pub use kem::pq::{MlKem768, MlKem768P256, MlKem1024, XWingDraft06};
 
 mod context;
 

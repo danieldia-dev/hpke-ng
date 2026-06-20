@@ -6,7 +6,11 @@
 
 use alloc::vec::Vec;
 
+use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand_core::{CryptoRng, RngCore};
+use sha3::Digest as _;
+use shake::digest::{ExtendableOutput, Update, XofReader};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::HpkeError;
@@ -159,7 +163,6 @@ impl Kem for XWingDraft06 {
 
 	fn derive_key_pair(ikm: &[u8]) -> Result<(Self::PrivateKey, Self::PublicKey), HpkeError> {
 		// X-Wing draft-06 specifies raw SHAKE-256(ikm, 32) for DeriveKeyPair.
-		use shake::digest::{ExtendableOutput, Update, XofReader};
 		let mut hasher = shake::Shake256::default();
 		hasher.update(ikm);
 		let mut reader = hasher.finalize_xof();
@@ -261,6 +264,322 @@ fn keypair_from_seed(seed: [u8; 32]) -> (XWingPrivateKey, XWingPublicKey) {
 			parsed: ek,
 		},
 	)
+}
+
+// ---------------------------------------------------------------------------
+// MLKEM768-P256 (draft-irtf-cfrg-hybrid-kems; IANA HPKE KEM ID 0x0050).
+//
+// Generic hybrid combiner: unlike X-Wing (which is a purpose-built combiner),
+// encap/decap here drive ML-KEM-768 and P-256 separately and combine with
+// SHA3-256(ss_pq || ss_t || ct_t || ek_t || "MLKEM768-P256").
+// ---------------------------------------------------------------------------
+
+/// MLKEM768-P256 hybrid KEM.
+///
+/// Hybrid ML-KEM-768 + P-256. Implements [`Kem`] only — no auth variant.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MlKem768P256;
+
+impl Sealed for MlKem768P256 {}
+
+/// Public (encapsulation) key for MLKEM768-P256.
+///
+/// Wire format: 1184 bytes ML-KEM-768 encapsulation key || 65 bytes
+/// uncompressed P-256 public key (1249 total). Both halves are parsed
+/// once at construction so `encap` never re-decodes the wire bytes.
+#[derive(Clone, Debug)]
+pub struct MlKem768P256PublicKey {
+	bytes: [u8; 1249],
+	parsed_pq: ml_kem::EncapsulationKey768,
+	parsed_t: p256::PublicKey,
+}
+
+impl AsRef<[u8]> for MlKem768P256PublicKey {
+	fn as_ref(&self) -> &[u8] {
+		&self.bytes
+	}
+}
+
+/// Private (decapsulation) key for MLKEM768-P256.
+///
+/// Stores the canonical 32-byte seed plus the expanded `dk_pq`/`dk_t`,
+/// avoiding a re-derivation (SHAKE-256 expansion + P-256 rejection
+/// sampling) on every `decap` call.
+pub struct MlKem768P256PrivateKey {
+	seed: [u8; 32],
+	dk_pq: Option<ml_kem::DecapsulationKey768>,
+	dk_t: p256::SecretKey,
+	ek_t_bytes: [u8; 65],
+}
+impl Zeroize for MlKem768P256PrivateKey {
+	fn zeroize(&mut self) {
+		self.seed.zeroize();
+		self.dk_pq = None;
+		// p256::SecretKey has no Zeroize; overwrite with a dummy so the real
+		// scalar's Drop scrubs it.
+		let mut dummy = [0u8; 32];
+		dummy[31] = 1;
+		if let Ok(d) = p256::SecretKey::from_bytes(p256::FieldBytes::from_slice(&dummy)) {
+			let _ = core::mem::replace(&mut self.dk_t, d);
+		}
+	}
+}
+
+impl ZeroizeOnDrop for MlKem768P256PrivateKey {}
+
+impl Drop for MlKem768P256PrivateKey {
+	fn drop(&mut self) {
+		self.zeroize();
+	}
+}
+
+/// Encapsulated key (ciphertext) for MLKEM768-P256.
+///
+/// Wire format: 1088 bytes ML-KEM-768 ciphertext || 65 bytes uncompressed
+/// P-256 ephemeral public key (1153 total).
+#[derive(Clone, Debug)]
+pub struct MlKem768P256EncappedKey([u8; 1153]);
+
+impl AsRef<[u8]> for MlKem768P256EncappedKey {
+	fn as_ref(&self) -> &[u8] {
+		&self.0
+	}
+}
+
+/// Shared secret produced by MLKEM768-P256 encap/decap.
+pub struct MlKem768P256SharedSecret([u8; 32]);
+
+impl AsRef<[u8]> for MlKem768P256SharedSecret {
+	fn as_ref(&self) -> &[u8] {
+		&self.0
+	}
+}
+
+impl Zeroize for MlKem768P256SharedSecret {
+	fn zeroize(&mut self) {
+		self.0.zeroize();
+	}
+}
+
+impl Drop for MlKem768P256SharedSecret {
+	fn drop(&mut self) {
+		self.zeroize();
+	}
+}
+
+/// Derive an MLKEM768-P256 keypair from a 32-byte seed via a SHAKE-256
+/// fan-out: first 64 bytes are to seed ML-KEM-768, next 128 bytes feed
+/// P-256 rejection sampling (32-byte chunks, first valid scalar "wins").
+fn keypair_from_seed_mlkem_p256(
+	seed: [u8; 32],
+) -> Result<(MlKem768P256PrivateKey, MlKem768P256PublicKey), HpkeError> {
+	let mut pq_seed = [0u8; 64];
+	let mut t_seed = [0u8; 128];
+	let mut xof = shake::Shake256::default();
+	xof.update(&seed);
+	let mut reader = xof.finalize_xof();
+	reader.read(&mut pq_seed);
+	reader.read(&mut t_seed);
+
+	// ML-KEM half.
+	let ml_seed: ml_kem::Seed = pq_seed.into();
+	let dk_pq = ml_kem::DecapsulationKey768::from_seed(ml_seed);
+	let ek_pq = dk_pq.encapsulation_key().clone();
+	pq_seed.zeroize();
+
+	// P-256 half (rejection sampling over 32-byte chunks).
+	let dk_t = t_seed
+		.chunks_exact(32)
+		.find_map(|chunk| p256::SecretKey::from_bytes(p256::FieldBytes::from_slice(chunk)).ok())
+		.ok_or(HpkeError::DeriveKeyPairError)?;
+	let ek_t = dk_t.public_key();
+	let ek_t_encoded = ek_t.to_encoded_point(false);
+	t_seed.zeroize();
+
+	// Pack public key bytes: ek_pq || ek_t (uncompressed).
+	let mut bytes = [0u8; 1249];
+	bytes[..1184].copy_from_slice(&ek_pq.to_bytes());
+	bytes[1184..].copy_from_slice(ek_t_encoded.as_bytes());
+
+	let mut ek_t_arr = [0u8; 65];
+	ek_t_arr.copy_from_slice(ek_t_encoded.as_bytes());
+
+	Ok((
+		MlKem768P256PrivateKey {
+			seed,
+			dk_pq: Some(dk_pq),
+			dk_t,
+			ek_t_bytes: ek_t_arr,
+		},
+		MlKem768P256PublicKey {
+			bytes,
+			parsed_pq: ek_pq,
+			parsed_t: ek_t,
+		},
+	))
+}
+
+impl Kem for MlKem768P256 {
+	const ID: u16 = 0x0050;
+	const ENCAPPED_KEY_LEN: usize = 1153;
+	const PUBLIC_KEY_LEN: usize = 1249;
+	const PRIVATE_KEY_LEN: usize = 32;
+	const SHARED_SECRET_LEN: usize = 32;
+
+	type PublicKey = MlKem768P256PublicKey;
+	type PrivateKey = MlKem768P256PrivateKey;
+	type EncappedKey = MlKem768P256EncappedKey;
+	type SharedSecret = MlKem768P256SharedSecret;
+
+	fn generate<R: CryptoRng + RngCore>(
+		rng: &mut R,
+	) -> Result<(Self::PrivateKey, Self::PublicKey), HpkeError> {
+		let mut seed = [0u8; 32];
+		rng.fill_bytes(&mut seed);
+		keypair_from_seed_mlkem_p256(seed)
+	}
+
+	fn derive_key_pair(ikm: &[u8]) -> Result<(Self::PrivateKey, Self::PublicKey), HpkeError> {
+		// draft-irtf-cfrg-hybrid-kems §5.5 DeriveKeyPair: SHAKE-256(ikm, 32)
+		// produces the seed, same construction as X-Wing's DeriveKeyPair above.
+		let mut hasher = shake::Shake256::default();
+		hasher.update(ikm);
+		let mut reader = hasher.finalize_xof();
+		let mut seed = [0u8; 32];
+		reader.read(&mut seed);
+		keypair_from_seed_mlkem_p256(seed)
+	}
+
+	fn encap<R: CryptoRng + RngCore>(
+		rng: &mut R,
+		pk_r: &Self::PublicKey,
+	) -> Result<(Self::SharedSecret, Self::EncappedKey), HpkeError> {
+		// ML-KEM half: cached parsed `parsed_pq` skips the per-call wire decode.
+		let (ct_pq, mut ss_pq) = {
+			let mut compat = RngCompat10(rng);
+			pk_r.parsed_pq.encapsulate_with_rng(&mut compat)
+		};
+		// P-256 half: generate the ephemeral exactly as GenerateKeyPair does
+		// (rejection-sample 32-byte chunks from a fixed 128-byte candidate buffer
+		// drawn directly from the RNG). Matches the spec's derandomized Encaps and
+		// `keypair_from_seed_mlkem_p256`'s rule, so a fixed `randomness` reproduces
+		// the vector's ephemeral. p256's native EphemeralSecret::random draws a
+		// different amount a different way and can never reproduce a KAT.
+		// Note that the recipient can't tell the difference, so this is interop-neutral.
+		let mut t_cand = [0u8; 128];
+		rng.fill_bytes(&mut t_cand);
+		let sk_e = t_cand
+			.chunks_exact(32)
+			.find_map(|chunk| p256::SecretKey::from_bytes(p256::FieldBytes::from_slice(chunk)).ok())
+			.ok_or(HpkeError::EncapError)?;
+		t_cand.zeroize();
+		let ct_t = sk_e.public_key();
+		let ss_t = p256::ecdh::diffie_hellman(sk_e.to_nonzero_scalar(), pk_r.parsed_t.as_affine());
+
+		let ct_t_bytes = ct_t.to_encoded_point(false);
+		let ek_t_bytes = pk_r.parsed_t.to_encoded_point(false);
+
+		let mut concat = [0u8; 207];
+		concat[..32].copy_from_slice(ss_pq.as_ref());
+		concat[32..64].copy_from_slice(ss_t.raw_secret_bytes());
+		concat[64..129].copy_from_slice(ct_t_bytes.as_bytes());
+		concat[129..194].copy_from_slice(ek_t_bytes.as_bytes());
+		concat[194..].copy_from_slice(b"MLKEM768-P256");
+		ss_pq.zeroize();
+		// SHA3-256(ss_pq || ss_t || ct_t_bytes || ek_t_bytes || label).
+		let ss = sha3::Sha3_256::digest(concat.as_slice());
+		concat.zeroize();
+
+		// Pack encapped key: ct_pq || ct_t (uncompressed).
+		let mut ek = [0u8; 1153];
+		ek[..1088].copy_from_slice(ct_pq.as_slice());
+		ek[1088..].copy_from_slice(ct_t_bytes.as_bytes());
+
+		Ok((
+			MlKem768P256SharedSecret(ss.into()),
+			MlKem768P256EncappedKey(ek),
+		))
+	}
+
+	fn decap(
+		enc: &Self::EncappedKey,
+		sk_r: &Self::PrivateKey,
+	) -> Result<Self::SharedSecret, HpkeError> {
+		let (ct_pq, ct_t_bytes) = enc.0.split_at(1088);
+		// ML-KEM half.
+		let ct: ml_kem::ml_kem_768::Ciphertext = ct_pq
+			.try_into()
+			.map_err(|_| HpkeError::InvalidEncappedKey)?;
+
+		// P-256 half: `ek_t` derived from our own static key for the combiner.
+		let dk_pq = sk_r.dk_pq.as_ref().ok_or(HpkeError::DecapError)?;
+		let mut ss_pq = dk_pq.decapsulate(&ct);
+		let ct_t = p256::PublicKey::from_sec1_bytes(ct_t_bytes)
+			.map_err(|_| HpkeError::InvalidEncappedKey)?;
+		let ss_t = p256::ecdh::diffie_hellman(sk_r.dk_t.to_nonzero_scalar(), ct_t.as_affine());
+
+		let mut concat = [0u8; 207];
+		concat[..32].copy_from_slice(ss_pq.as_ref());
+		concat[32..64].copy_from_slice(ss_t.raw_secret_bytes());
+		concat[64..129].copy_from_slice(ct_t_bytes);
+		concat[129..194].copy_from_slice(&sk_r.ek_t_bytes);
+		concat[194..].copy_from_slice(b"MLKEM768-P256");
+		ss_pq.zeroize();
+		let ss = sha3::Sha3_256::digest(concat.as_slice());
+		concat.zeroize();
+
+		Ok(MlKem768P256SharedSecret(ss.into()))
+	}
+
+	fn pk_from_bytes(b: &[u8]) -> Result<Self::PublicKey, HpkeError> {
+		if b.len() != Self::PUBLIC_KEY_LEN {
+			return Err(HpkeError::InvalidPublicKey);
+		}
+		let mut bytes = [0u8; 1249];
+		bytes.copy_from_slice(b);
+		let (pq_bytes, t_bytes) = b.split_at(1184);
+
+		let ek_bytes: ml_kem::kem::Key<ml_kem::EncapsulationKey768> = pq_bytes
+			.try_into()
+			.map_err(|_| HpkeError::InvalidPublicKey)?;
+		let parsed_pq =
+			ml_kem::EncapsulationKey768::new(&ek_bytes).map_err(|_| HpkeError::InvalidPublicKey)?;
+		let parsed_t =
+			p256::PublicKey::from_sec1_bytes(t_bytes).map_err(|_| HpkeError::InvalidPublicKey)?;
+
+		Ok(MlKem768P256PublicKey {
+			bytes,
+			parsed_pq,
+			parsed_t,
+		})
+	}
+
+	fn sk_from_bytes(b: &[u8]) -> Result<Self::PrivateKey, HpkeError> {
+		if b.len() != 32 {
+			return Err(HpkeError::InvalidPrivateKey);
+		}
+		let mut seed = [0u8; 32];
+		seed.copy_from_slice(b);
+		let (sk, _pk) = keypair_from_seed_mlkem_p256(seed)?;
+		Ok(sk)
+	}
+
+	fn enc_from_bytes(b: &[u8]) -> Result<Self::EncappedKey, HpkeError> {
+		if b.len() != Self::ENCAPPED_KEY_LEN {
+			return Err(HpkeError::InvalidEncappedKey);
+		}
+		let mut arr = [0u8; 1153];
+		arr.copy_from_slice(b);
+		Ok(MlKem768P256EncappedKey(arr))
+	}
+
+	fn pk_to_bytes(pk: &Self::PublicKey) -> Vec<u8> {
+		pk.bytes.to_vec()
+	}
+
+	fn sk_to_bytes(sk: &Self::PrivateKey) -> Zeroizing<Vec<u8>> {
+		Zeroizing::new(sk.seed.to_vec())
+	}
 }
 
 // ---------------------------------------------------------------------------
